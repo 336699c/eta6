@@ -15,14 +15,9 @@ import csv
 import util
 
 _CTB_Stop = {};
-const_CTB_route = json.loads(getReq("https://rt.data.gov.hk/v2/transport/citybus/route/ctb"))
+const_CTB_route = json.loads(util.getReq("https://rt.data.gov.hk/v2/transport/citybus/route/ctb"))
 _CTB_rt = {}
 _CTB_Stop_Route = {};
-
-def getReq(link, data=""):
-  x = requests.get(link)
-  print(link, x.status_code)
-  return x.content,data
 
 for i in _0_CTB_route["data"]:
   _CTB_rt[i["route"]] = {"co":"CTB", "route":i["route"], 
