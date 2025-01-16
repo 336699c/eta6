@@ -14,12 +14,12 @@ import csv
 #Self
 import util
 
-'''
+
 _CTB_Stop = {};
 const_CTB_route = json.loads(util.getReq("https://rt.data.gov.hk/v2/transport/citybus/route/ctb"))
 _CTB_rt = {}
 _CTB_Stop_Route = {};
-
+'''
 for i in const_CTB_route["data"]:
   _CTB_rt[i["route"]] = {"co":"CTB", "route":i["route"], 
     "I":{"route":i["route"], "bound":"I", "orig_tc":i["dest_tc"], "orig_en":i["dest_en"], "dest_tc":i["orig_tc"], "dest_en":i["orig_en"], "stops":[]},
