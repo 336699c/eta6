@@ -19,7 +19,7 @@ _CTB_Stop = {};
 const_CTB_route = json.loads(util.getReq("https://rt.data.gov.hk/v2/transport/citybus/route/ctb"))
 _CTB_rt = {}
 _CTB_Stop_Route = {};
-'''
+
 for i in const_CTB_route["data"]:
   _CTB_rt[i["route"]] = {"co":"CTB", "route":i["route"], 
     "I":{"route":i["route"], "bound":"I", "orig_tc":i["dest_tc"], "orig_en":i["dest_en"], "dest_tc":i["orig_tc"], "dest_en":i["orig_en"], "stops":[]},
@@ -43,7 +43,7 @@ for i in _CTB_rt:
 
 for i in _CTB_Stop_Route.keys():
   _CTB_Stop[i] = json.loads(util.getReq("https://rt.data.gov.hk/v2/transport/citybus/stop/"+str(i)))["data"]
-'''
+
 
 with open('_CTB_Stop.json', 'w') as f:
   f.write(json.dumps(_CTB_Stop, ensure_ascii=False))
