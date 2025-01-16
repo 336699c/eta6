@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  test-p:
+  ctb:
     runs-on: ubuntu-latest
     permissions:
       contents: write
