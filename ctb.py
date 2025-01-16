@@ -14,6 +14,7 @@ import csv
 #Self
 import util
 
+'''
 _CTB_Stop = {};
 const_CTB_route = json.loads(util.getReq("https://rt.data.gov.hk/v2/transport/citybus/route/ctb"))
 _CTB_rt = {}
@@ -42,7 +43,7 @@ for i in _CTB_rt:
 
 for i in _CTB_Stop_Route.keys():
   _CTB_Stop[i] = json.loads(util.getReq("https://rt.data.gov.hk/v2/transport/citybus/stop/"+str(i)))["data"]
-
+'''
 
 with open('_CTB_Stop.json', 'w') as f:
   f.write(json.dumps(_CTB_Stop, ensure_ascii=False))
