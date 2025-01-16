@@ -29,8 +29,8 @@ for i in _0_CTB_route["data"]:
     "I":{"route":i["route"], "bound":"I", "orig_tc":i["dest_tc"], "orig_en":i["dest_en"], "dest_tc":i["orig_tc"], "dest_en":i["orig_en"], "stops":[]},
     "O":{"route":i["route"], "bound":"O", "dest_tc":i["dest_tc"], "dest_en":i["dest_en"], "orig_tc":i["orig_tc"], "orig_en":i["orig_en"], "stops":[]}
   }
-  _CTB_rt[i["route"]]["I"]["stops"] = list(map(lambda x: x["stop"],json.loads(getReq("https://rt.data.gov.hk/v2/transport/citybus/route-stop/ctb/"+i["route"]+"/inbound"))["data"]))
-  _CTB_rt[i["route"]]["O"]["stops"] = list(map(lambda x: x["stop"],json.loads(getReq("https://rt.data.gov.hk/v2/transport/citybus/route-stop/ctb/"+i["route"]+"/outbound"))["data"]))
+  _CTB_rt[i["route"]]["I"]["stops"] = list(map(lambda x: x["stop"],json.loads(util.getReq("https://rt.data.gov.hk/v2/transport/citybus/route-stop/ctb/"+i["route"]+"/inbound"))["data"]))
+  _CTB_rt[i["route"]]["O"]["stops"] = list(map(lambda x: x["stop"],json.loads(util.getReq("https://rt.data.gov.hk/v2/transport/citybus/route-stop/ctb/"+i["route"]+"/outbound"))["data"]))
 
 
 for i in _CTB_rt:
@@ -46,7 +46,7 @@ for i in _CTB_rt:
   except: pass;
 
 for i in _CTB_Stop_Route.keys():
-  _CTB_Stop[i] = getReq("https://rt.data.gov.hk/v2/transport/citybus/stop/"+str(i))["data"]
+  _CTB_Stop[i] = util.getReq("https://rt.data.gov.hk/v2/transport/citybus/stop/"+str(i))["data"]
 
 
 with open('_CTB_Stop.json', 'w') as f:
