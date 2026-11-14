@@ -27,9 +27,10 @@ from urllib.parse import quote
 
 from build_static import (ALPHABET, ALPHABET_SIZE, BUS_CODE_LEN, GMB_CODE_LEN,
                           LAT_RANGE, LON_RANGE, NEARBY_LIMIT, NEARBY_RADIUS,
-                          REMOTE_BASE, TD_PREFIX, WALK_SPEED, build_nearby,
-                          code_from_index, distance_m, index_from_code,
-                          name_score, previous_json, previous_text, write_json)
+                          REMOTE_BASE, TD_PREFIX, WALK_SPEED, VariantIdMapper,
+                          build_nearby, code_from_index, distance_m,
+                          index_from_code, name_score, previous_json,
+                          previous_text, route_slug, write_json)
 from util import get_json, get_req
 
 KMB_STOP_URL = "https://data.etabus.gov.hk/v1/transport/kmb/stop/"
@@ -58,6 +59,11 @@ NAME_MIN = 0.34
 NLB_WORKERS = 6
 KMB_ROUTE_WORKERS = 8
 BUS_3_CAPACITY = ALPHABET_SIZE ** BUS_CODE_LEN
+
+NATIVE_ROUTE_PREFIX = "native:"
+NATIVE_STABLE_PREFIX = "NATIVE|"
+NATIVE_MERGE_RADIUS = 200.0
+OPERATOR_ORDER = ("KMB", "LWB", "CTB", "NLB", "GMB", "MTR", "LRTFeeder")
 
 
 def log(message):
@@ -626,9 +632,272 @@ def primary_link(rows):
         -row.get("q", row["c"]), row["d"], row["td"]))[0]
 
 
+def normalized_route(value):
+    return str(value or "").strip().upper()
+
+
+def operator_rank(name):
+    try:
+        return OPERATOR_ORDER.index(name)
+    except ValueError:
+        return len(OPERATOR_ORDER)
+
+
+def is_native_only_variant(variant):
+    return (variant.get("tdRouteId") is None
+            and str(variant.get("stableKey") or "").startswith(NATIVE_STABLE_PREFIX))
+
+
+def covered_td_route_numbers(variants):
+    covered = defaultdict(set)
+    for variant in variants.values():
+        number = normalized_route(variant.get("route"))
+        if not number:
+            continue
+        for agency in variant.get("co") or []:
+            operator = AGENCY_OPERATOR.get(agency)
+            if operator:
+                covered[operator].add(number)
+    return covered
+
+
+def build_native_only_variants(variants, index_payload, native_routes,
+                               native_stops, registry, variant_mapper, started):
+    """Emit operator-only routes that have no corresponding TD variant."""
+    covered = covered_td_route_numbers(variants)
+    groups = defaultdict(list)
+    seen = set()
+    stats = {"routes": 0, "variants": 0, "byOperator": defaultdict(int),
+             "skipped": []}
+    used_route_ids = {entry.get("id") for entry in
+                      (index_payload.get("routes") or {}).values()}
+
+    for operator in sorted(native_routes):
+        for route in native_routes[operator]:
+            number = str(route.get("route") or "").strip()
+            norm = normalized_route(number)
+            if not number:
+                continue
+            if norm in covered.get(operator, set()):
+                continue
+            stops = [str(stop) for stop in route.get("stops") or []]
+            if len(stops) < 2:
+                stats["skipped"].append("%s %s: fewer than 2 stops" % (operator, number))
+                continue
+            missing = [stop for stop in stops
+                       if stop not in native_stops.get(operator, {})]
+            if missing:
+                stats["skipped"].append("%s %s: missing stops %s" % (
+                    operator, number, ",".join(missing[:3])))
+                continue
+            sequence_key = (operator, norm, route.get("bound"), tuple(stops))
+            if sequence_key in seen:
+                continue
+            seen.add(sequence_key)
+
+            codes = [registry.native_to_code[native_key(operator, stop)]
+                     for stop in stops]
+            digest = hashlib.sha1(",".join(stops).encode("utf-8")).hexdigest()[:16]
+            stable_key = "%s%s|%s|%s|%s|%s|%s" % (
+                NATIVE_STABLE_PREFIX, operator, number, route.get("bound"),
+                stops[0], stops[-1], digest)
+            preferred = "%s_%s_%s1" % (operator, route_slug(number), route.get("bound"))
+            variant_id, _ = variant_mapper.assign(stable_key, preferred)
+
+            orig = dict(route.get("orig") or {"en": "", "zh": ""})
+            dest = dict(route.get("dest") or {"en": "", "zh": ""})
+            circular = len(codes) > 1 and codes[0] == codes[-1]
+            variant = {
+                "id": variant_id,
+                "co": [operator],
+                "route": number,
+                "bound": route.get("bound"),
+                "tdRouteId": None,
+                "nativeRouteId": "%s:%s:%s:%s" % (
+                    operator, number, route.get("bound"), route.get("serviceType", "")),
+                "stableKey": stable_key,
+                "orig": orig,
+                "dest": dest,
+                "circular": circular,
+                "stops": codes,
+                "operatorStopCodes": {operator: codes},
+                "freq": {},
+                "fixedDepartures": {},
+                "fares": {"currency": "HKD", "kind": "flat", "flat": None},
+                "hasHolidayFare": False,
+                "sources": {"static": operator + "_API",
+                            "generatedAt": started.isoformat(timespec="seconds")},
+            }
+            variants[variant_id] = variant
+            index_payload.setdefault("variants", {})[variant_id] = {
+                "co": [operator], "route": number, "bound": route.get("bound"),
+                "orig": orig, "dest": dest, "circular": circular,
+                "stops": len(codes), "services": [], "freq": {},
+            }
+            groups[norm].append(variant_id)
+            stats["variants"] += 1
+            stats["byOperator"][operator] += 1
+
+    route_keys = set(index_payload.get("routes") or {})
+    for norm, ids in sorted(groups.items()):
+        ids.sort(key=lambda vid: (
+            operator_rank((variants[vid].get("co") or [""])[0]), vid))
+        first = variants[ids[0]]
+        route_key = NATIVE_ROUTE_PREFIX + norm
+        suffix = 2
+        base_key = route_key
+        while route_key in route_keys:
+            route_key = "%s_%d" % (base_key, suffix)
+            suffix += 1
+        route_keys.add(route_key)
+
+        operators = sorted({name for vid in ids for name in
+                            (variants[vid].get("co") or [])},
+                           key=lambda name: (operator_rank(name), name))
+        primary = operators[0] if operators else "KMB"
+        route_id_base = "%s_%s" % (primary, route_slug(first["route"]))
+        route_id = route_id_base
+        suffix = 2
+        while route_id in used_route_ids:
+            route_id = "%s_%d" % (route_id_base, suffix)
+            suffix += 1
+        used_route_ids.add(route_id)
+
+        index_payload.setdefault("routes", {})[route_key] = {
+            "co": operators,
+            "route": first["route"],
+            "orig": first["orig"],
+            "dest": first["dest"],
+            "variants": ids,
+            "id": route_id,
+        }
+        stats["routes"] += 1
+
+    stats["byOperator"] = dict(sorted(stats["byOperator"].items()))
+    return stats
+
+
+def sequences_close(left, right, final_stops, radius=NATIVE_MERGE_RADIUS):
+    left_stops = left.get("stops") or []
+    right_stops = right.get("stops") or []
+    if not left_stops or len(left_stops) != len(right_stops):
+        return False
+    for left_code, right_code in zip(left_stops, right_stops):
+        left_record = final_stops.get(left_code)
+        right_record = final_stops.get(right_code)
+        if not left_record or not right_record:
+            return False
+        if distance_m(left_record["loc"], right_record["loc"]) > radius:
+            return False
+    return True
+
+
+def merge_native_only_variants(variants, index_payload, final_stops):
+    """Merge close operator-only variants; TD routes are never touched."""
+    td_numbers = {normalized_route(variant.get("route"))
+                  for variant in variants.values()
+                  if not is_native_only_variant(variant)}
+    groups = defaultdict(list)
+    for variant_id, variant in variants.items():
+        if is_native_only_variant(variant):
+            groups[normalized_route(variant.get("route"))].append(variant_id)
+
+    stats = {"groups": 0, "variants": 0, "skippedTd": []}
+    for number, ids in sorted(groups.items()):
+        if number in td_numbers:
+            stats["skippedTd"].append(number)
+            continue
+        ids.sort(key=lambda vid: (
+            operator_rank((variants[vid].get("co") or [""])[0]), vid))
+        parent = {vid: vid for vid in ids}
+
+        def find(value):
+            while parent[value] != value:
+                parent[value] = parent[parent[value]]
+                value = parent[value]
+            return value
+
+        def union(left, right):
+            left_root, right_root = find(left), find(right)
+            if left_root != right_root:
+                parent[right_root] = left_root
+
+        for position, left in enumerate(ids):
+            for right in ids[position + 1:]:
+                left_variant = variants[left]
+                right_variant = variants[right]
+                if set(left_variant.get("co") or []) & set(right_variant.get("co") or []):
+                    continue
+                if sequences_close(left_variant, right_variant, final_stops):
+                    union(left, right)
+
+        components = defaultdict(list)
+        for variant_id in ids:
+            components[find(variant_id)].append(variant_id)
+
+        for component in components.values():
+            if len(component) < 2:
+                continue
+            component_operators = [operator for vid in component
+                                   for operator in (variants[vid].get("co") or [])]
+            if len(component_operators) != len(set(component_operators)):
+                continue
+            canonical = sorted(component, key=lambda vid: (
+                -len(variants[vid].get("co") or []),
+                operator_rank((variants[vid].get("co") or [""])[0]),
+                vid))[0]
+            others = sorted(vid for vid in component if vid != canonical)
+            target = variants[canonical]
+
+            target["co"] = sorted({
+                name for vid in component for name in
+                (variants[vid].get("co") or [])},
+                key=lambda name: (operator_rank(name), name))
+            target["mergedFrom"] = others
+
+            bounds = {}
+            arrays = {}
+            for vid in component:
+                variant = variants[vid]
+                for operator in variant.get("co") or []:
+                    bounds.setdefault(operator, variant.get("bound"))
+                for operator, array in (variant.get("operatorStopCodes") or {}).items():
+                    arrays.setdefault(operator, array)
+            if arrays:
+                target["operatorStopCodes"] = arrays
+            if len(set(bounds.values())) > 1:
+                target["bounds"] = bounds
+            else:
+                target.pop("bounds", None)
+
+            for other in others:
+                variants.pop(other, None)
+                index_payload.get("variants", {}).pop(other, None)
+            stats["groups"] += 1
+            stats["variants"] += len(others)
+
+    if stats["variants"]:
+        for entry in index_payload.get("routes", {}).values():
+            seen = []
+            for variant_id in entry.get("variants") or []:
+                if variant_id not in variants:
+                    continue
+                if variant_id not in seen:
+                    seen.append(variant_id)
+            entry["variants"] = seen
+            operators = {name for vid in seen for name in
+                         (variants[vid].get("co") or [])}
+            if operators:
+                entry["co"] = sorted(operators, key=lambda name: (
+                    operator_rank(name), name))
+            if not seen:
+                entry["variants"] = []
+    return stats
+
+
 def assemble(args, stops_payload, variants, index_payload, native_stops,
              native_routes, previous_state, previous_stops, previous_map,
-             previous_td_codes, overrides, started):
+             previous_td_codes, overrides, started, previous_variants=None):
     candidates, links, unmatched = build_links(
         native_stops, StopIndex(stops_payload), overrides, alignments={}, variants=variants)
     # Route alignment is recomputed here with the complete candidate map.
@@ -736,6 +1005,22 @@ def assemble(args, stops_payload, variants, index_payload, native_stops,
         entry = dict(td_records[td])
         entry["tds"] = [td]
         final_stops[code] = entry
+
+    native_only_stats = {"routes": 0, "variants": 0, "byOperator": {},
+                         "skipped": []}
+    native_merge_stats = {"groups": 0, "variants": 0, "skippedTd": []}
+    if getattr(args, "native_only_routes", True):
+        variant_mapper = VariantIdMapper({
+            variant["stableKey"]: variant_id
+            for variant_id, variant in (previous_variants or {}).items()
+            if variant.get("stableKey")
+        })
+        variant_mapper.used.update(variants)
+        native_only_stats = build_native_only_variants(
+            variants, index_payload, native_routes, native_stops, registry,
+            variant_mapper, started)
+        native_merge_stats = merge_native_only_variants(
+            variants, index_payload, final_stops)
 
     # Route-specific arrays and canonical display codes.
     td_to_codes = defaultdict(set)
@@ -882,7 +1167,9 @@ def assemble(args, stops_payload, variants, index_payload, native_stops,
             "stop_routes": stop_routes, "nearby": nearby, "operator_map": output,
             "state": registry.state(), "unmatched": unmatched,
             "alignment": alignment_stats, "mergedGroups": merged,
-            "ambiguousTd": len(ambiguous_td)}
+            "ambiguousTd": len(ambiguous_td),
+            "nativeOnlyRoutes": native_only_stats,
+            "nativeMergedRoutes": native_merge_stats}
 
 
 def company_ids(previous_map, code):
@@ -917,6 +1204,9 @@ def main(argv=None):
     parser.add_argument("--previous-dir", default="")
     parser.add_argument("--remote-base", default=REMOTE_BASE)
     parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--no-native-only-routes", dest="native_only_routes",
+                        action="store_false",
+                        help="do not emit routes that are absent from TD")
     args = parser.parse_args(argv)
     started = datetime.now(timezone.utc)
 
@@ -936,6 +1226,7 @@ def main(argv=None):
     previous_stops = previous_json("stops.json", args.previous_dir, remote_base) or {}
     previous_map = previous_json("operator_map.json", args.previous_dir, remote_base) or {}
     previous_td_map = previous_json("__stops.json", args.previous_dir, remote_base) or {}
+    previous_variants = previous_json("routeStop.json", args.previous_dir, remote_base) or {}
     previous_td_codes = {str(td): code for td, code in previous_td_map.items()}
     if previous_stops:
         previous_td_codes.update({str(row["td"]): code for code, row in previous_stops.items()
@@ -961,7 +1252,7 @@ def main(argv=None):
 
     result = assemble(args, stops_payload, variants, index_payload, native_stops,
                       native_routes, previous_state, previous_stops, previous_map,
-                      previous_td_codes, overrides, started)
+                      previous_td_codes, overrides, started, previous_variants)
     out = args.static
     names = ("stops.json", "routeStop.json", "index.json", "stop_routes.json",
              "nearby.json", "operator_map.json")
@@ -989,15 +1280,28 @@ def main(argv=None):
         for code in sorted(lines):
             handle.write(lines[code] + "\n")
 
+    native_only_active = sum(1 for variant in variants.values()
+                             if is_native_only_variant(variant))
     manifest_path = os.path.join(out, "manifest.json")
     manifest = load_json(manifest_path) if os.path.isfile(manifest_path) else {}
     manifest.setdefault("counts", {}).update({
+        "routes": len(result["index"].get("routes", {})),
         "stops": len(current_stops),
         "busStops": sum(row.get("mode") == "bus" for row in current_stops.values()),
         "gmbStops": sum(row.get("mode") == "gmb" for row in current_stops.values()),
         "nearbyPairs": sum(len(rows) for rows in result["nearby"].values()),
-        "variants": len(variants)})
+        "variants": len(variants),
+        "nativeOnlyRoutes": result["nativeOnlyRoutes"]["routes"],
+        "nativeOnlyVariants": native_only_active})
     manifest["routeStop"] = {"path": "routeStop.json", "count": len(variants)}
+    manifest["nativeOnlyRoutes"] = dict(result["nativeOnlyRoutes"])
+    manifest["nativeOnlyRoutes"]["variantsCreated"] = result["nativeOnlyRoutes"]["variants"]
+    manifest["nativeOnlyRoutes"]["variantsActive"] = native_only_active
+    manifest["nativeMergedRoutes"] = result["nativeMergedRoutes"]
+    if result["nativeOnlyRoutes"]["skipped"]:
+        manifest.setdefault("warnings", []).extend(
+            "native-only route skipped: " + message
+            for message in result["nativeOnlyRoutes"]["skipped"][:20])
     manifest["operatorMap"] = {
         "path": "operator_map.json", "params": result["operator_map"]["params"],
         "operators": {name: {key: value for key, value in row.items() if key != "stops"}
@@ -1027,6 +1331,11 @@ def main(argv=None):
     log("native groups=%d TD-only=%d merges=%d ambiguous TD=%d" % (
         len(result["state"]["groups"]), len(result["state"]["tdCodes"]),
         result["mergedGroups"], result["ambiguousTd"]))
+    log("native-only routes=%d variants=%d proximity-merges=%d/%d" % (
+        result["nativeOnlyRoutes"]["routes"],
+        result["nativeOnlyRoutes"]["variants"],
+        result["nativeMergedRoutes"]["groups"],
+        result["nativeMergedRoutes"]["variants"]))
     log("wrote native-pole dataset -> %s" % os.path.abspath(out))
     return 0
 

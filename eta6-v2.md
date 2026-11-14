@@ -181,6 +181,31 @@ merged 1 groups, removed 1 duplicate variants (3467 left)
 The script rewrites `routeStop.json`, `index.json`, `stop_routes.json` and the
 manifest counts/hashes. It is idempotent.
 
+### 6.2 Operator-only routes
+
+`build_operator_map.py` also emits route sequences that exist in the KMB or CTB
+route-stop APIs but have no TD variant. These are published as:
+
+* route key `native:<route number>`, e.g. `native:SP1` or `native:SP10`;
+* variant ids in the normal form (`KMB_SP1_O1`, `CTB_SP10_O1`, …);
+* `tdRouteId: null`, `sources.static: "KMB_API"` or `"CTB_API"`;
+* empty `freq` / `fixedDepartures` and `fares.flat: null`, because the operator
+  route APIs provide no timetable or fare data.
+
+For a route number that is absent from TD, variants from different operators
+may be merged by proximity. Two variants merge when:
+
+1. the route number is the same;
+2. the stop sequences have the same length;
+3. every corresponding stop pair is within `NATIVE_MERGE_RADIUS` (200 m).
+
+This proximity rule is applied **only** to operator-only variants. Routes that
+exist anywhere in TD are never merged this way; they keep the exact-sequence
+rule from §6.1. A merged operator-only variant keeps one operator's stop codes
+in `stops`, stores all per-operator arrays in `operatorStopCodes`, unions `co`,
+and records absorbed ids in `mergedFrom`. `--no-native-only-routes` disables
+this whole stage.
+
 ---
 
 ## 7. Published file formats
@@ -192,14 +217,19 @@ manifest counts/hashes. It is idempotent.
   "version": "v2026-11-10",
   "builtAt": "2026-11-14T09:14:13+00:00",
   "source": { "dataset": "TD ... (GTFS)", "feed": "...", "validFrom": "2026-11-10" },
-  "counts": { "routes": 2364, "variants": 3467, "stops": 9205,
-              "busStops": 4433, "gmbStops": 4772, "nearbyPairs": 47760 },
+  "counts": { "routes": 2454, "variants": 3585, "stops": 9205,
+              "busStops": 4433, "gmbStops": 4772, "nearbyPairs": 47760,
+              "nativeOnlyRoutes": 90, "nativeOnlyVariants": 118 },
   "files": { "index.json": { "bytes": 3009574, "sha256": "..." }, "...": {} },
   "routeStop": { "path": "routeStop.json", "count": 3467 },
   "build": { "durationSeconds": 11.1,
              "fareKinds": { "flat": 1015, "ladder": 55, "matrix": 2402 },
              "unresolvedDirections": 98, "newStopCodes": 0, "reservedCodes": 0 },
   "mergedRoutes": { "groups": 1, "variants": 1 },
+  "nativeOnlyRoutes": { "routes": 90, "variantsCreated": 123,
+                        "variantsActive": 118, "byOperator": { "CTB": 39, "KMB": 84 },
+                        "skipped": [] },
+  "nativeMergedRoutes": { "groups": 5, "variants": 5, "skippedTd": ["20R", "71P"] },
   "deprecatedStops": { "path": "deprecated_stop.txt", "count": 0 },
   "operatorMap": {
     "path": "operator_map.json",
@@ -424,8 +454,9 @@ Add an entry to `overrides/operator_stops.json`, commit, run the workflow:
 
 * 98 variants carry `directionGuessed` (mostly GMB routes without a resolvable
   `A - B` long name).
-* TD coverage of racecourse/special routes is incomplete; they are absent
-  rather than patched in.
+* TD coverage of racecourse/special routes is incomplete. Matching KMB/CTB
+  route sequences are now emitted as operator-only routes, but without
+  timetable or fare data.
 * Route merging keeps the canonical timetable and fares; when two merged
   variants disagree, the difference is logged but the other values are not
   published.
