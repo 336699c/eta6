@@ -64,6 +64,7 @@ jobs:
             static/nearby.json
             static/operator_map.json
             static/__stops.json
+            static/__stop_codes.json
             static/deprecated_stop.txt
           github-token: ${{ secrets.GITHUB_TOKEN }}
           commit-msg: Static data | TD GTFS build

@@ -1,22 +1,15 @@
 #!/usr/bin/env python3
-"""Map operator-native stop ids onto the canonical TD stop codes (Phase 2).
+"""Build native-pole stop codes and route-specific operator stop arrays.
 
-Input : static/stops.json produced by build_static.py
-Output: static/operator_map.json (+ stats folded into static/manifest.json)
+A public bus code identifies at most one native pole per company. TD stops are
+only linked to those codes; they no longer define bus-stop identity. Codes are
+persistent in __stop_codes.json. New bus codes use three characters and roll
+over to four when the three-character space is exhausted. GMB is handled by
+build_static.py and never enters this allocator.
 
-Matching is coordinate + name based:
-  * every TD bus stop is indexed on a ~200 m grid;
-  * an operator stop is matched to the best TD stop within 80 m;
-  * candidates carrying the operator's own TD name tag get the operator name
-    for the name score, other stops fall back to the canonical English name;
-  * accept when distance <= 15 m, or name similarity >= 0.34 at <= 60 m
-    (>= 0.5 beyond 60 m).
-
-Many operator stops may map to one TD code: a TD stop identifies a location
-group (both directions, several poles), while operator APIs return one id per
-pole. Manual overrides live in overrides/operator_stops.json:
-
-  {"KMB": {"<operatorStopId>": "<tdStopId>"}, ...}
+Route-stop sequences provide conservative evidence for TD links, co-op pole
+sharing, per-operator bounds, and repeated-stop disambiguation. Ambiguous
+one-to-many matches are deliberately left in separate codes.
 """
 
 import argparse
@@ -24,47 +17,59 @@ import csv
 import hashlib
 import io
 import json
+import math
 import os
 import sys
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from urllib.parse import quote
 
-from build_static import (LAT_RANGE, LON_RANGE, REMOTE_BASE, distance_m,
-                          name_score, previous_json, previous_text)
+from build_static import (ALPHABET, ALPHABET_SIZE, BUS_CODE_LEN, GMB_CODE_LEN,
+                          LAT_RANGE, LON_RANGE, NEARBY_LIMIT, NEARBY_RADIUS,
+                          REMOTE_BASE, TD_PREFIX, WALK_SPEED, build_nearby,
+                          code_from_index, distance_m, index_from_code,
+                          name_score, previous_json, previous_text, write_json)
 from util import get_json, get_req
 
-# The trailing slash matters: without it the gateway answers 403.
 KMB_STOP_URL = "https://data.etabus.gov.hk/v1/transport/kmb/stop/"
-CTB_STOP_URL = (
-    "https://raw.githubusercontent.com/336699c/eta6/refs/heads/data/"
-    "_CTB_Stop.json"
-)
+KMB_ROUTE_URL = "https://data.etabus.gov.hk/v1/transport/kmb/route/"
+KMB_ROUTE_STOP_URL = "https://data.etabus.gov.hk/v1/transport/kmb/route-stop/%s/%s/%s"
+CTB_BASE = "https://raw.githubusercontent.com/336699c/eta6/refs/heads/data/"
+CTB_STOP_URL = CTB_BASE + "_CTB_Stop.json"
+CTB_ROUTE_URL = CTB_BASE + "_CTB_rt.json"
 NLB_ROUTE_URL = "https://rt.data.gov.hk/v2/transport/nlb/route.php?action=list"
-NLB_STOP_URL = (
-    "https://rt.data.gov.hk/v2/transport/nlb/stop.php?action=list&routeId=%s"
-)
+NLB_STOP_URL = "https://rt.data.gov.hk/v2/transport/nlb/stop.php?action=list&routeId=%s"
 MTR_STOP_URL = "https://opendata.mtr.com.hk/data/mtr_bus_stops.csv"
 
 OPERATORS = ("KMB", "CTB", "NLB", "MTR")
-
-# TD tags that represent each operator. KMB+CTB / LWB+CTB are joint poles.
 OPERATOR_TAGS = {
     "KMB": {"KMB", "KMB+CTB", "LWB", "LWB+CTB"},
     "CTB": {"CTB", "KMB+CTB", "LWB+CTB"},
     "NLB": {"NLB"},
     "MTR": {"LRTFeeder"},
 }
-
-GRID_CELL = 0.002  # ~200 m
+AGENCY_OPERATOR = {"KMB": "KMB", "LWB": "KMB", "CTB": "CTB",
+                   "NLB": "NLB", "LRTFeeder": "MTR"}
+GRID_CELL = 0.002
 MATCH_RADIUS = 80.0
 AUTO_ACCEPT = 15.0
 NAME_MIN = 0.34
 NLB_WORKERS = 6
+KMB_ROUTE_WORKERS = 8
+BUS_3_CAPACITY = ALPHABET_SIZE ** BUS_CODE_LEN
 
 
 def log(message):
     print(message, flush=True)
+
+
+def native_key(operator, stop_id):
+    return "%s:%s" % (operator, stop_id)
+
+
+def split_native_key(key):
+    return key.split(":", 1)
 
 
 def valid_location(loc):
@@ -73,11 +78,10 @@ def valid_location(loc):
 
 
 # --------------------------------------------------------------------------
-# operator stop lists
+# Native stops and route sequences
 # --------------------------------------------------------------------------
 
 def fetch_kmb():
-    """KMB and LWB share one API; one call returns every pole."""
     payload = get_json(KMB_STOP_URL)
     stops = {}
     for row in payload.get("data") or []:
@@ -88,23 +92,17 @@ def fetch_kmb():
             loc = (float(row["lat"]), float(row["long"]))
         except (KeyError, TypeError, ValueError):
             continue
-        if not valid_location(loc):
-            continue
-        stops[stop_id] = {
-            "en": (row.get("name_en") or "").strip(),
-            "zh": (row.get("name_tc") or "").strip(),
-            "loc": loc,
-        }
+        if valid_location(loc):
+            stops[stop_id] = {"en": (row.get("name_en") or "").strip(),
+                              "zh": (row.get("name_tc") or "").strip(), "loc": loc}
     return stops, []
 
 
 def fetch_ctb():
-    """CTB stops from the eta6 data branch snapshot."""
     payload = get_json(CTB_STOP_URL)
     if not isinstance(payload, dict):
         raise RuntimeError("CTB stop snapshot is not an object")
-    stops = {}
-    issues = []
+    stops, issues = {}, []
     for stop_id, row in payload.items():
         if not isinstance(row, dict):
             continue
@@ -116,26 +114,16 @@ def fetch_ctb():
         if not valid_location(loc):
             issues.append("%s: coordinates outside HK bounds" % stop_id)
             continue
-        stops[str(stop_id)] = {
-            "en": (row.get("name_en") or "").strip(),
-            "zh": (row.get("name_tc") or "").strip(),
-            "loc": loc,
-        }
+        stops[str(stop_id)] = {"en": (row.get("name_en") or "").strip(),
+                               "zh": (row.get("name_tc") or "").strip(), "loc": loc}
     return stops, issues
 
 
 def fetch_nlb():
-    """NLB has no bulk stop list: one call per route, deduplicated by stop id."""
     payload = get_json(NLB_ROUTE_URL)
     routes = payload.get("routes") or payload.get("data") or []
-    stop_ids = []
-    for route in routes:
-        route_id = route.get("routeId")
-        if route_id is not None:
-            stop_ids.append(str(route_id))
-
-    stops = {}
-    issues = []
+    route_ids = [str(row["routeId"]) for row in routes if row.get("routeId") is not None]
+    stops, issues = {}, []
 
     def load(route_id):
         try:
@@ -149,30 +137,23 @@ def fetch_nlb():
             except (KeyError, TypeError, ValueError):
                 problems.append("route %s: bad coordinates" % route_id)
                 continue
-            if not valid_location(loc):
-                problems.append("route %s: coordinates outside HK bounds" % route_id)
-                continue
             rows.append((str(row.get("stopId") or "").strip(), {
                 "en": (row.get("stopName_e") or "").strip(),
-                "zh": (row.get("stopName_c") or "").strip(),
-                "loc": loc,
-            }))
+                "zh": (row.get("stopName_c") or "").strip(), "loc": loc}))
         return rows, problems
 
     with ThreadPoolExecutor(max_workers=NLB_WORKERS) as pool:
-        for rows, problems in pool.map(load, stop_ids):
+        for rows, problems in pool.map(load, route_ids):
             issues.extend(problems)
             for stop_id, record in rows:
-                if stop_id and stop_id not in stops:
+                if stop_id and valid_location(record["loc"]) and stop_id not in stops:
                     stops[stop_id] = record
     return stops, issues
 
 
 def fetch_mtr():
-    """MTR Bus / LRT feeder CSV: one row per route-direction, dedupe by stop."""
     body = get_req(MTR_STOP_URL).decode("utf-8-sig", errors="replace")
-    stops = {}
-    issues = []
+    stops, issues = {}, []
     for row in csv.DictReader(io.StringIO(body)):
         stop_id = (row.get("STATION_ID") or "").strip()
         if not stop_id:
@@ -182,133 +163,726 @@ def fetch_mtr():
         except (KeyError, TypeError, ValueError):
             issues.append("%s: bad coordinates" % stop_id)
             continue
-        if not valid_location(loc):
-            issues.append("%s: coordinates outside HK bounds" % stop_id)
-            continue
-        stops[stop_id] = {
-            "en": (row.get("STATION_NAME_ENG") or "").strip(),
-            "zh": (row.get("STATION_NAME_CHI") or "").strip(),
-            "loc": loc,
-        }
+        if valid_location(loc):
+            stops[stop_id] = {"en": (row.get("STATION_NAME_ENG") or "").strip(),
+                              "zh": (row.get("STATION_NAME_CHI") or "").strip(), "loc": loc}
     return stops, issues
 
 
-FETCHERS = {
-    "KMB": fetch_kmb,
-    "CTB": fetch_ctb,
-    "NLB": fetch_nlb,
-    "MTR": fetch_mtr,
-}
+FETCHERS = {"KMB": fetch_kmb, "CTB": fetch_ctb, "NLB": fetch_nlb, "MTR": fetch_mtr}
+
+
+def bilingual(en, zh):
+    return {"en": en or "", "zh": zh or en or ""}
+
+
+def fetch_kmb_routes():
+    rows = get_json(KMB_ROUTE_URL).get("data") or []
+
+    def load(row):
+        route = str(row.get("route") or "")
+        bound = str(row.get("bound") or "O").upper()
+        service = str(row.get("service_type") or "1")
+        direction = "inbound" if bound == "I" else "outbound"
+        try:
+            payload = get_json(KMB_ROUTE_STOP_URL % (
+                quote(route, safe=""), direction, quote(service, safe="")))
+            stops = [str(item.get("stop") or "") for item in payload.get("data") or []]
+            stops = [stop for stop in stops if stop]
+            error = None
+        except RuntimeError as exc:
+            stops, error = [], str(exc)
+        return {"route": route, "bound": bound, "serviceType": service,
+                "orig": bilingual(row.get("orig_en"), row.get("orig_tc")),
+                "dest": bilingual(row.get("dest_en"), row.get("dest_tc")),
+                "stops": stops}, error
+
+    routes, issues = [], []
+    with ThreadPoolExecutor(max_workers=KMB_ROUTE_WORKERS) as pool:
+        for route, error in pool.map(load, rows):
+            if route["stops"]:
+                routes.append(route)
+            if error:
+                issues.append("%s %s/%s: %s" % (
+                    route["route"], route["bound"], route["serviceType"], error))
+    return routes, issues
+
+
+def fetch_ctb_routes():
+    payload = get_json(CTB_ROUTE_URL)
+    routes = []
+    for number, row in sorted(payload.items()):
+        for bound in ("I", "O"):
+            item = row.get(bound) or {}
+            stops = [str(stop) for stop in item.get("stops") or [] if stop]
+            if stops:
+                routes.append({"route": str(number), "bound": bound, "serviceType": "1",
+                               "orig": bilingual(item.get("orig_en"), item.get("orig_tc")),
+                               "dest": bilingual(item.get("dest_en"), item.get("dest_tc")),
+                               "stops": stops})
+    return routes, []
+
+
+ROUTE_FETCHERS = {"KMB": fetch_kmb_routes, "CTB": fetch_ctb_routes}
 
 
 # --------------------------------------------------------------------------
-# matching
+# TD candidates and sequence alignment
 # --------------------------------------------------------------------------
 
 class StopIndex:
     def __init__(self, stops_payload):
-        self.records = {}
-        self.grid = defaultdict(list)
-        for code, record in stops_payload.items():
-            if record.get("mode") != "bus":
+        self.records, self.grid = {}, defaultdict(list)
+        for key, record in stops_payload.items():
+            if record.get("mode") != "bus" or not record.get("loc"):
                 continue
-            loc = record.get("loc")
-            if not loc:
-                continue
-            self.records[code] = record
-            self.grid[(int(loc[0] / GRID_CELL), int(loc[1] / GRID_CELL))].append(code)
+            self.records[key] = record
+            loc = record["loc"]
+            self.grid[(int(loc[0] / GRID_CELL), int(loc[1] / GRID_CELL))].append(key)
 
-    def candidates(self, loc, tags):
-        cell = (int(loc[0] / GRID_CELL), int(loc[1] / GRID_CELL))
+    def candidates(self, operator, stop, override=None):
         rows = []
+        cell = (int(stop["loc"][0] / GRID_CELL), int(stop["loc"][1] / GRID_CELL))
         for dr in (-1, 0, 1):
             for dc in (-1, 0, 1):
-                for code in self.grid.get((cell[0] + dr, cell[1] + dc), ()):
-                    record = self.records[code]
-                    dist = distance_m(loc, record["loc"])
+                for key in self.grid.get((cell[0] + dr, cell[1] + dc), ()):
+                    record = self.records[key]
+                    td = str(record.get("td") or "")
+                    if override is not None and td != str(override):
+                        continue
+                    dist = distance_m(stop["loc"], record["loc"])
                     if dist <= MATCH_RADIUS:
-                        rows.append((dist, code, record))
-        tagged = [row for row in rows
-                  if tags & set((row[2].get("ops") or {}).keys())]
-        return tagged or rows
-
-
-def score_candidate(stop, record, dist):
-    names = [record.get("en") or ""]
-    names.extend((record.get("ops") or {}).values())
-    similarity = max(name_score(stop["en"], name) for name in names)
-    score = 0.65 * similarity + 0.35 * (1.0 - dist / MATCH_RADIUS)
-    accepted = (
-        dist <= AUTO_ACCEPT
-        or (similarity >= NAME_MIN and (dist <= 60 or similarity >= 0.5))
-    )
-    method = "coord" if dist <= AUTO_ACCEPT and similarity < NAME_MIN else "coord+name"
-    return similarity, score, accepted, method
-
-
-def match_operator(operator, operator_stops, index, overrides):
-    tags = OPERATOR_TAGS[operator]
-    td_to_code = {record["td"]: code for code, record in index.records.items()}
-    mapping = {}
-    unmatched = []
-    method_counts = defaultdict(int)
-    bands = {"15": 0, "30": 0, "60": 0, "80": 0}
-
-    for stop_id, stop in sorted(operator_stops.items()):
-        override = overrides.get(stop_id)
-        if override:
-            code = td_to_code.get(str(override))
-            if code:
-                record = index.records[code]
-                mapping[stop_id] = {
-                    "td": record["td"],
-                    "code": code,
-                    "d": round(distance_m(stop["loc"], record["loc"]), 1),
-                    "c": 1.0,
-                    "m": "override",
-                }
-                method_counts["override"] += 1
+                        rows.append((dist, key, record))
+        if override is None:
+            tagged = [row for row in rows if OPERATOR_TAGS[operator]
+                      & set((row[2].get("ops") or {}).keys())]
+            rows = tagged or rows
+        result = []
+        for dist, key, record in rows:
+            if override is not None:
+                result.append({"td": str(record["td"]), "d": round(dist, 1),
+                               "c": 1.0, "m": "override", "q": 1.0})
                 continue
+            names = [record.get("en") or ""] + list((record.get("ops") or {}).values())
+            similarity = max(name_score(stop["en"], name) for name in names)
+            quality = 0.65 * similarity + 0.35 * (1.0 - dist / MATCH_RADIUS)
+            accepted = (dist <= AUTO_ACCEPT or
+                        (similarity >= NAME_MIN and (dist <= 60 or similarity >= 0.5)))
+            if accepted:
+                result.append({"td": str(record["td"]), "d": round(dist, 1),
+                               "c": round(quality, 3),
+                               "m": "coord" if dist <= AUTO_ACCEPT and similarity < NAME_MIN
+                               else "coord+name", "q": quality})
+        result.sort(key=lambda row: (-row["q"], row["d"], row["td"]))
+        return result
 
-        best = None
-        for dist, code, record in index.candidates(stop["loc"], tags):
-            similarity, score, accepted, method = score_candidate(stop, record, dist)
-            if not accepted:
+
+def align_sequences(td_ids, operator_stop_ids, candidates):
+    """Global alignment; native supersets are cheap, missed TD stops are not."""
+    n, m = len(td_ids), len(operator_stop_ids)
+    quality = []
+    for stop_id in operator_stop_ids:
+        quality.append({row["td"]: row["q"] for row in candidates.get(stop_id, [])})
+    dp = [[None] * (m + 1) for _ in range(n + 1)]
+    back = [[None] * (m + 1) for _ in range(n + 1)]
+    dp[0][0] = (0.0, 0)
+    for i in range(1, n + 1):
+        dp[i][0] = (dp[i - 1][0][0] - 1.25, dp[i - 1][0][1])
+        back[i][0] = "T"
+    for j in range(1, m + 1):
+        dp[0][j] = (dp[0][j - 1][0] - 0.12, 0)
+        back[0][j] = "N"
+
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            options = [(dp[i][j - 1][0] - 0.12, dp[i][j - 1][1], "N"),
+                       (dp[i - 1][j][0] - 1.25, dp[i - 1][j][1], "T")]
+            q = quality[j - 1].get(td_ids[i - 1])
+            if q is not None:
+                options.append((dp[i - 1][j - 1][0] + 2.0 + q,
+                                dp[i - 1][j - 1][1] + 1, "M"))
+            best = max(options, key=lambda row: (row[0], row[1], row[2] == "M"))
+            dp[i][j], back[i][j] = best[:2], best[2]
+
+    pairs = []
+    i, j = n, m
+    while i or j:
+        action = back[i][j]
+        if action == "M":
+            pairs.append((i - 1, j - 1, quality[j - 1][td_ids[i - 1]]))
+            i, j = i - 1, j - 1
+        elif action == "T":
+            i -= 1
+        else:
+            j -= 1
+    pairs.reverse()
+    return {"pairs": pairs, "matched": len(pairs), "score": dp[n][m][0]}
+
+
+def direction_score(variant, route):
+    return (name_score((variant.get("orig") or {}).get("en", ""), route["orig"]["en"])
+            + name_score((variant.get("dest") or {}).get("en", ""), route["dest"]["en"]))
+
+
+def align_routes(variants, native_routes, candidates):
+    alignments = {}
+    stats = defaultdict(lambda: {"variants": 0, "positions": 0})
+    for variant_id, variant in sorted(variants.items()):
+        td_ids = [key[len(TD_PREFIX):] for key in variant.get("stops") or []
+                  if key.startswith(TD_PREFIX)]
+        if len(td_ids) < 2 or len(td_ids) != len(variant.get("stops") or []):
+            continue  # GMB-only or degenerate variant
+        for agency in variant.get("co") or []:
+            operator = AGENCY_OPERATOR.get(agency)
+            if operator not in native_routes:
                 continue
-            key = (score, -dist)
-            if best is None or key > best[0]:
-                best = (key, dist, code, record, score, method)
+            best = None
+            for route in native_routes[operator]:
+                if route["route"] != variant.get("route"):
+                    continue
+                aligned = align_sequences(td_ids, route["stops"],
+                                          candidates.get(operator, {}))
+                minimum = min(2, len(td_ids)) if len(td_ids) <= 3 else math.ceil(len(td_ids) * 0.45)
+                if aligned["matched"] < minimum:
+                    continue
+                rank = (aligned["score"] + direction_score(variant, route),
+                        aligned["matched"], -abs(len(td_ids) - len(route["stops"])),
+                        route["bound"], route["serviceType"])
+                if best is None or rank > best[0]:
+                    best = (rank, route, aligned)
+            if best is not None:
+                alignments.setdefault(variant_id, {})[operator] = {
+                    "route": best[1], "pairs": best[2]["pairs"],
+                    "matched": best[2]["matched"], "score": round(best[2]["score"], 3)}
+                stats[operator]["variants"] += 1
+                stats[operator]["positions"] += best[2]["matched"]
+    return alignments, stats
 
-        if best is None:
-            unmatched.append({
-                "id": stop_id,
-                "en": stop["en"],
-                "zh": stop["zh"],
-                "loc": [round(stop["loc"][0], 5), round(stop["loc"][1], 5)],
-            })
+
+def propagate_coop_alignments(alignments, variants, stats):
+    """Fill missing co-op positions only between consistent native anchors.
+
+    If every shared TD position has the same target/donor native-index offset,
+    that offset is reliable sequence evidence even when a pole is beyond the
+    ordinary coordinate radius. No offset is guessed across divergent segments.
+    """
+    for variant_id, by_operator in alignments.items():
+        if len(by_operator) < 2:
             continue
+        for target, target_aligned in by_operator.items():
+            target_used = {native_index for _, native_index, _ in target_aligned["pairs"]}
+            target_at_td = {td_index: native_index
+                            for td_index, native_index, _ in target_aligned["pairs"]}
+            for donor, donor_aligned in by_operator.items():
+                if donor == target:
+                    continue
+                donor_at_td = {td_index: (native_index, quality)
+                               for td_index, native_index, quality in donor_aligned["pairs"]}
+                shared = [(target_at_td[i], donor_at_td[i][0]) for i in target_at_td
+                          if i in donor_at_td]
+                if len(shared) < 2:
+                    continue
+                offsets = {left - right for left, right in shared}
+                if len(offsets) != 1:
+                    continue
+                offset = next(iter(offsets))
+                target_size = len(target_aligned["route"]["stops"])
+                added = []
+                for td_index, (donor_index, quality) in sorted(donor_at_td.items()):
+                    if td_index in target_at_td:
+                        continue
+                    native_index = donor_index + offset
+                    if not (0 <= native_index < target_size) or native_index in target_used:
+                        continue
+                    added.append((td_index, native_index, min(0.8, quality)))
+                    target_used.add(native_index)
+                if added:
+                    target_aligned["pairs"].extend(added)
+                    target_aligned["pairs"].sort()
+                    target_aligned["matched"] += len(added)
+                    stats[target]["positions"] += len(added)
+                    target_at_td.update({i: j for i, j, _ in added})
+    return alignments
 
-        _, dist, code, record, score, method = best
-        mapping[stop_id] = {
-            "td": record["td"],
-            "code": code,
-            "d": round(dist, 1),
-            "c": round(score, 3),
-            "m": method,
-        }
-        method_counts[method] += 1
-        for limit in (15, 30, 60, 80):
-            if dist <= limit:
-                bands[str(limit)] += 1
 
-    return {
-        "count": len(operator_stops),
-        "matched": len(mapping),
-        "ratio": round(len(mapping) / len(operator_stops), 4) if operator_stops else 0,
-        "within": bands,
-        "methods": dict(method_counts),
-        "stops": mapping,
-    }, unmatched
+# --------------------------------------------------------------------------
+# Persistent native codes
+# --------------------------------------------------------------------------
+
+class NativeCodeRegistry:
+    def __init__(self, state=None, historical_codes=(), collision_codes=(),
+                 capacity3=BUS_3_CAPACITY):
+        state = state if isinstance(state, dict) else {}
+        self.groups = {}
+        self.native_to_code = {}
+        for code, row in (state.get("groups") or {}).items():
+            operators = {str(op): str(stop) for op, stop in
+                         (row.get("operators") or {}).items()}
+            self.groups[code] = {"operators": operators}
+            for op, stop in operators.items():
+                self.native_to_code[native_key(op, stop)] = code
+        self.td_codes = {str(td): code for td, code in
+                         (state.get("tdCodes") or {}).items()}
+        self.reserved = set(state.get("reserved") or []) | set(historical_codes)
+        self.reserved -= set(self.groups)
+        self.collisions = set(collision_codes)
+        self.capacity3 = capacity3
+        self.next_index = 0
+        for code in self.groups:
+            if code and all(char in ALPHABET for char in code):
+                try:
+                    self.next_index = max(self.next_index, index_from_code(code) + 1)
+                except ValueError:
+                    pass
+
+    def _can_use(self, code, operator):
+        return code not in self.groups or operator not in self.groups[code]["operators"]
+
+    def _activate(self, code, operator, stop_id):
+        group = self.groups.setdefault(code, {"operators": {}})
+        group["operators"][operator] = stop_id
+        self.native_to_code[native_key(operator, stop_id)] = code
+        self.reserved.discard(code)
+        return code
+
+    def _allocate(self, operator, stop_id):
+        while True:
+            length = BUS_CODE_LEN if self.next_index < self.capacity3 else GMB_CODE_LEN
+            code = code_from_index(self.next_index, length)
+            self.next_index += 1
+            if code not in self.groups and code not in self.reserved and code not in self.collisions:
+                return self._activate(code, operator, stop_id)
+
+    def assign(self, key, preferred=None, allow_cross=False):
+        if key in self.native_to_code:
+            return self.native_to_code[key]
+        operator, stop_id = split_native_key(key)
+        if preferred and self._can_use(preferred, operator):
+            other_company = (preferred in self.groups and
+                             any(op != operator for op in self.groups[preferred]["operators"]))
+            if allow_cross or not other_company:
+                return self._activate(preferred, operator, stop_id)
+        return self._allocate(operator, stop_id)
+
+    def merge(self, left, right):
+        a, b = self.native_to_code[left], self.native_to_code[right]
+        if a == b:
+            return False
+        ga, gb = self.groups[a]["operators"], self.groups[b]["operators"]
+        if set(ga) & set(gb):
+            return False
+        survivor, retired = sorted((a, b), key=lambda code: (index_from_code(code), code))
+        keep, drop = survivor, retired
+        moving = self.groups[drop]["operators"]
+        self.groups[keep]["operators"].update(moving)
+        for op, stop in moving.items():
+            self.native_to_code[native_key(op, stop)] = keep
+        del self.groups[drop]
+        self.reserved.add(drop)
+        return True
+
+    def assign_td(self, td, preferred=None):
+        if td in self.td_codes:
+            code = self.td_codes[td]
+            if code not in self.groups:
+                self.reserved.discard(code)
+                return code
+            del self.td_codes[td]
+        if preferred and preferred not in self.groups:
+            code = preferred
+            self.reserved.discard(code)
+        else:
+            code = self._allocate("TD", td)
+            # _allocate created a placeholder native group; TD-only groups are
+            # represented separately and must not become a fake company pole.
+            del self.groups[code]["operators"]["TD"]
+            if not self.groups[code]["operators"]:
+                del self.groups[code]
+            self.native_to_code.pop(native_key("TD", td), None)
+        self.td_codes[td] = code
+        return code
+
+    def retire_unused_td(self, active_td):
+        for td, code in list(self.td_codes.items()):
+            if td not in active_td:
+                self.reserved.add(code)
+                del self.td_codes[td]
+
+    def state(self):
+        return {"version": 1,
+                "groups": {code: self.groups[code] for code in sorted(self.groups)},
+                "tdCodes": {td: self.td_codes[td] for td in sorted(self.td_codes)},
+                "reserved": sorted(self.reserved)}
+
+
+# --------------------------------------------------------------------------
+# Dataset assembly
+# --------------------------------------------------------------------------
+
+def load_json(path):
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def build_links(native_stops, index, overrides, alignments, variants):
+    candidates = {op: {} for op in native_stops}
+    links = {op: {} for op in native_stops}
+    unmatched = {op: [] for op in native_stops}
+    for operator, stops in native_stops.items():
+        for stop_id, stop in sorted(stops.items()):
+            rows = index.candidates(operator, stop, (overrides.get(operator) or {}).get(stop_id))
+            candidates[operator][stop_id] = rows
+            if rows:
+                best = dict(rows[0])
+                best["q"] = float(best.get("q", best["c"]))
+                links[operator][stop_id] = {best["td"]: best}
+            else:
+                links[operator][stop_id] = {}
+                unmatched[operator].append({"id": stop_id, "en": stop["en"],
+                    "zh": stop["zh"], "loc": [round(stop["loc"][0], 5), round(stop["loc"][1], 5)]})
+
+    td_records = {str(record.get("td")): record for record in index.records.values()}
+    for variant_id, by_operator in alignments.items():
+        td_ids = [key[len(TD_PREFIX):] for key in variants[variant_id]["stops"]]
+        for operator, aligned in by_operator.items():
+            native_ids = aligned["route"]["stops"]
+            for td_index, native_index, quality in aligned["pairs"]:
+                stop_id = native_ids[native_index]
+                td = td_ids[td_index]
+                row = {"td": td, "d": 0, "c": round(quality, 3),
+                       "m": "route", "q": quality}
+                native = native_stops[operator].get(stop_id)
+                td_record = td_records.get(td)
+                if native and td_record:
+                    row["d"] = round(distance_m(native["loc"], td_record["loc"]), 1)
+                old = links[operator][stop_id].get(td)
+                if old is None or quality > old.get("q", 0):
+                    links[operator][stop_id][td] = row
+    return candidates, links, unmatched
+
+
+def safe_cross_company_pairs(alignments, variants, links, native_stops, stops_payload):
+    evidence = defaultdict(int)
+    for variant_id, by_operator in alignments.items():
+        td_ids = [key[len(TD_PREFIX):] for key in variants[variant_id]["stops"]]
+        at_position = defaultdict(dict)
+        for operator, aligned in by_operator.items():
+            for td_index, native_index, _ in aligned["pairs"]:
+                stop_id = aligned["route"]["stops"][native_index]
+                at_position[td_index][operator] = stop_id
+        for operators in at_position.values():
+            keys = sorted(native_key(op, stop) for op, stop in operators.items())
+            for i, left in enumerate(keys):
+                for right in keys[i + 1:]:
+                    evidence[(left, right)] += 1
+
+    # A unique, jointly tagged TD pole is additional evidence. One-to-many
+    # locations (CTB 1 / KMB many, etc.) intentionally produce no pair.
+    by_td = defaultdict(lambda: defaultdict(list))
+    for operator, rows in links.items():
+        for stop_id, td_rows in rows.items():
+            for td in td_rows:
+                by_td[td][operator].append(stop_id)
+    td_records = {str(row.get("td")): row for row in stops_payload.values()
+                  if row.get("mode") == "bus"}
+    for td, by_operator in by_td.items():
+        record = td_records.get(td) or {}
+        if not ({"KMB+CTB", "LWB+CTB"} & set((record.get("ops") or {}).keys())):
+            continue
+        if any(len(stop_ids) != 1 for stop_ids in by_operator.values()):
+            continue
+        keys = sorted(native_key(op, rows[0]) for op, rows in by_operator.items())
+        for i, left in enumerate(keys):
+            for right in keys[i + 1:]:
+                op_a, id_a = split_native_key(left)
+                op_b, id_b = split_native_key(right)
+                a, b = native_stops[op_a][id_a], native_stops[op_b][id_b]
+                if (distance_m(a["loc"], b["loc"]) <= 25
+                        and name_score(a["en"], b["en"]) >= NAME_MIN):
+                    evidence[(left, right)] += 1
+
+    partners = defaultdict(lambda: defaultdict(set))
+    for left, right in evidence:
+        op_a, _ = split_native_key(left)
+        op_b, _ = split_native_key(right)
+        partners[left][op_b].add(right)
+        partners[right][op_a].add(left)
+    safe = []
+    for pair, count in evidence.items():
+        left, right = pair
+        op_a, _ = split_native_key(left)
+        op_b, _ = split_native_key(right)
+        if partners[left][op_b] == {right} and partners[right][op_a] == {left}:
+            safe.append((count, pair))
+    return [pair for _, pair in sorted(safe, key=lambda row: (-row[0], row[1]))]
+
+
+def primary_link(rows):
+    values = rows.values() if isinstance(rows, dict) else rows
+    if not values:
+        return None
+    return sorted(values, key=lambda row: (
+        0 if row["m"] in ("route", "override") else 1,
+        -row.get("q", row["c"]), row["d"], row["td"]))[0]
+
+
+def assemble(args, stops_payload, variants, index_payload, native_stops,
+             native_routes, previous_state, previous_stops, previous_map,
+             previous_td_codes, overrides, started):
+    candidates, links, unmatched = build_links(
+        native_stops, StopIndex(stops_payload), overrides, alignments={}, variants=variants)
+    # Route alignment is recomputed here with the complete candidate map.
+    alignments, alignment_stats = align_routes(variants, native_routes, candidates)
+    propagate_coop_alignments(alignments, variants, alignment_stats)
+    candidates, links, unmatched = build_links(
+        native_stops, StopIndex(stops_payload), overrides, alignments, variants)
+
+    historical_bus_codes = {code for code, row in previous_stops.items()
+                            if row.get("mode") == "bus"}
+    historical_bus_codes |= {code for code in previous_td_codes.values()
+                             if len(code) == BUS_CODE_LEN}
+    gmb_codes = {code for code, row in stops_payload.items() if row.get("mode") == "gmb"}
+    gmb_codes |= {code for code in previous_td_codes.values() if len(code) == GMB_CODE_LEN}
+    registry = NativeCodeRegistry(previous_state, historical_bus_codes, gmb_codes)
+
+    route_td_op = defaultdict(lambda: defaultdict(set))
+    for variant_id, by_operator in alignments.items():
+        td_ids = [key[len(TD_PREFIX):] for key in variants[variant_id]["stops"]]
+        for operator, aligned in by_operator.items():
+            for td_index, native_index, _ in aligned["pairs"]:
+                route_td_op[td_ids[td_index]][operator].add(
+                    aligned["route"]["stops"][native_index])
+    ambiguous_td = {td for td, rows in route_td_op.items()
+                    if any(len(stop_ids) > 1 for stop_ids in rows.values())}
+
+    # On migration, route evidence decides which pole inherits the old TD code.
+    # Ambiguous locations do not share that code at all.
+    for td in sorted(route_td_op):
+        preferred = previous_td_codes.get(td)
+        if not preferred or td in ambiguous_td:
+            continue
+        for operator in sorted(route_td_op[td]):
+            stop_ids = route_td_op[td][operator]
+            if len(stop_ids) == 1:
+                registry.assign(native_key(operator, next(iter(stop_ids))),
+                                preferred, allow_cross=True)
+
+    previous_native_codes = {}
+    for operator, result in (previous_map.get("operators") or {}).items():
+        for stop_id, row in (result.get("stops") or {}).items():
+            if row.get("code"):
+                previous_native_codes[native_key(operator, stop_id)] = row["code"]
+    for operator, stops in native_stops.items():
+        for stop_id in sorted(stops):
+            key = native_key(operator, stop_id)
+            registry.assign(key, previous_native_codes.get(key), allow_cross=False)
+
+    merged = 0
+    for left, right in safe_cross_company_pairs(
+            alignments, variants, links, native_stops, stops_payload):
+        merged += int(registry.merge(left, right))
+
+    # Every active native pole now has a code. Attach all current TD links.
+    code_links = defaultdict(lambda: defaultdict(dict))
+    for operator, rows in links.items():
+        for stop_id, td_rows in rows.items():
+            code = registry.native_to_code[native_key(operator, stop_id)]
+            for td, row in td_rows.items():
+                old = code_links[code][operator].get(td)
+                if old is None or row.get("q", 0) > old.get("q", 0):
+                    code_links[code][operator][td] = row
+
+    linked_td = {td for by_operator in code_links.values() for rows in by_operator.values()
+                 for td in rows}
+    td_records = {str(row["td"]): row for row in stops_payload.values()
+                  if row.get("mode") == "bus"}
+    td_only_codes = {}
+    for td in sorted(td_records):
+        if td not in linked_td:
+            td_only_codes[td] = registry.assign_td(td, previous_td_codes.get(td))
+    registry.retire_unused_td(set(td_only_codes))
+    registry.reserved -= set(registry.groups)
+
+    # Build final native and TD-only stop records.
+    final_stops = {code: dict(record) for code, record in stops_payload.items()
+                   if record.get("mode") == "gmb"}
+    code_tds = defaultdict(set)
+    for code, by_operator in code_links.items():
+        for rows in by_operator.values():
+            code_tds[code].update(rows)
+    for code, group in registry.groups.items():
+        active = {op: stop for op, stop in group["operators"].items()
+                  if stop in native_stops.get(op, {})}
+        if not active:
+            continue
+        tds = sorted(code_tds.get(code, set()))
+        # Prefer route-confirmed TD identities over a coordinate-only alias.
+        link_rows = [row for rows in code_links.get(code, {}).values()
+                     for row in rows.values()]
+        best_link = primary_link(link_rows)
+        primary_td = best_link["td"] if best_link else (tds[0] if tds else None)
+        td_record = td_records.get(primary_td) if primary_td else None
+        first_operator, first_stop = sorted(active.items())[0]
+        native_record = native_stops[first_operator][first_stop]
+        source = td_record or native_record
+        entry = {"td": primary_td or "", "tds": tds, "mode": "bus",
+                 "en": source.get("en") or native_record["en"],
+                 "zh": source.get("zh") or source.get("en") or native_record["zh"],
+                 "loc": [round(native_record["loc"][0], 5), round(native_record["loc"][1], 5)]}
+        if source.get("ops"):
+            entry["ops"] = source["ops"]
+        final_stops[code] = entry
+    for td, code in td_only_codes.items():
+        entry = dict(td_records[td])
+        entry["tds"] = [td]
+        final_stops[code] = entry
+
+    # Route-specific arrays and canonical display codes.
+    td_to_codes = defaultdict(set)
+    for code, tds in code_tds.items():
+        for td in tds:
+            td_to_codes[td].add(code)
+    for td, code in td_only_codes.items():
+        td_to_codes[td].add(code)
+    code_operators = {code: set(group["operators"]) for code, group in registry.groups.items()}
+
+    for variant_id, variant in variants.items():
+        if not variant.get("stops") or not variant["stops"][0].startswith(TD_PREFIX):
+            continue
+        td_ids = [key[len(TD_PREFIX):] for key in variant["stops"]]
+        by_operator = alignments.get(variant_id, {})
+        operator_arrays = {}
+        for agency in variant.get("co") or []:
+            operator = AGENCY_OPERATOR.get(agency)
+            if operator not in OPERATORS:
+                continue
+            array = [None] * len(td_ids)
+            aligned = by_operator.get(operator)
+            if aligned:
+                for td_index, native_index, _ in aligned["pairs"]:
+                    stop_id = aligned["route"]["stops"][native_index]
+                    array[td_index] = registry.native_to_code[native_key(operator, stop_id)]
+            if any(array):
+                operator_arrays[operator] = array
+
+        agencies = [AGENCY_OPERATOR.get(name) for name in variant.get("co") or []]
+        primary_operator = next((op for op in agencies if op in OPERATORS), None)
+        display = []
+        for position, td in enumerate(td_ids):
+            code = None
+            if primary_operator in operator_arrays:
+                code = operator_arrays[primary_operator][position]
+            if code is None:
+                for operator in agencies:
+                    if operator in operator_arrays and operator_arrays[operator][position]:
+                        code = operator_arrays[operator][position]
+                        break
+            if code is None:
+                choices = sorted(td_to_codes.get(td, ()), key=lambda item: (
+                    not bool(code_operators.get(item, set()) & set(agencies)), item))
+                if choices:
+                    code = choices[0]
+            if code is None:
+                raise RuntimeError("no final code for TD stop %s in %s" % (td, variant_id))
+            display.append(code)
+        variant["stops"] = display
+        if operator_arrays:
+            variant["operatorStopCodes"] = operator_arrays
+
+        primary = by_operator.get(primary_operator)
+        if primary:
+            route = primary["route"]
+            forward = direction_score(variant, route)
+            reverse = (name_score((variant.get("orig") or {}).get("en", ""), route["dest"]["en"])
+                       + name_score((variant.get("dest") or {}).get("en", ""), route["orig"]["en"]))
+            if reverse > forward and reverse >= 0.5:
+                variant["orig"], variant["dest"] = variant.get("dest"), variant.get("orig")
+            variant["bound"] = route["bound"]
+            variant.pop("directionGuessed", None)
+            bounds = dict(variant.get("bounds") or {})
+            for operator, aligned in by_operator.items():
+                bounds[operator] = aligned["route"]["bound"]
+            if len(set(bounds.values())) > 1 or any(
+                    bounds.get(op) != variant["bound"] for op in bounds):
+                variant["bounds"] = bounds
+            elif "bounds" in variant:
+                del variant["bounds"]
+
+    # Refresh index summaries after native direction correction.
+    for variant_id, summary in index_payload.get("variants", {}).items():
+        variant = variants.get(variant_id)
+        if variant:
+            for field in ("bound", "orig", "dest", "co"):
+                summary[field] = variant[field]
+    for route_entry in index_payload.get("routes", {}).values():
+        ids = route_entry.get("variants") or []
+        if ids and ids[0] in variants:
+            route_entry["orig"] = variants[ids[0]]["orig"]
+            route_entry["dest"] = variants[ids[0]]["dest"]
+
+    stop_routes = defaultdict(set)
+    for variant_id, variant in variants.items():
+        codes = set(variant.get("stops") or [])
+        for array in (variant.get("operatorStopCodes") or {}).values():
+            codes.update(code for code in array if code)
+        for code in codes:
+            stop_routes[code].add(variant_id)
+    stop_routes = {code: sorted(ids) for code, ids in stop_routes.items()}
+    nearby = build_nearby({code: code for code in final_stops}, final_stops, stop_routes)
+
+    # Strict identity invariants.
+    seen_native = set()
+    for code, group in registry.groups.items():
+        active = [(op, stop) for op, stop in group["operators"].items()
+                  if stop in native_stops.get(op, {})]
+        if len({op for op, _ in active}) != len(active):
+            raise RuntimeError("same-company collision in %s" % code)
+        for op, stop in active:
+            key = native_key(op, stop)
+            if key in seen_native:
+                raise RuntimeError("native pole has multiple codes: %s" % key)
+            seen_native.add(key)
+    expected = {native_key(op, stop) for op, stops in native_stops.items() for stop in stops}
+    if seen_native != expected:
+        raise RuntimeError("not every active native pole has a code")
+    if any(len(code) == BUS_CODE_LEN for code, row in final_stops.items()
+           if row.get("mode") == "gmb"):
+        raise RuntimeError("GMB received a three-character code")
+
+    operators_output = {}
+    for operator, stops in native_stops.items():
+        rows = {}
+        linked_count = 0
+        for stop_id in sorted(stops):
+            td_rows = links[operator][stop_id]
+            primary = primary_link(td_rows)
+            linked_count += int(bool(td_rows))
+            row = {"code": registry.native_to_code[native_key(operator, stop_id)],
+                   "td": primary["td"] if primary else None,
+                   "tds": sorted(td_rows),
+                   "d": primary["d"] if primary else None,
+                   "c": primary["c"] if primary else 0,
+                   "m": primary["m"] if primary else "unmatched"}
+            rows[stop_id] = row
+        operators_output[operator] = {
+            "count": len(stops), "matched": len(stops), "ratio": 1.0 if stops else 0,
+            "tdLinked": linked_count,
+            "tdRatio": round(linked_count / len(stops), 4) if stops else 0,
+            "stops": rows}
+
+    output = {"version": args.version or "v" + started.strftime("%Y%m%d-%H%M"),
+              "generatedAt": started.isoformat(timespec="seconds"),
+              "params": {"identity": "native-pole", "radiusM": MATCH_RADIUS,
+                         "autoAcceptM": AUTO_ACCEPT, "nameMin": NAME_MIN,
+                         "nameMinFar": 0.5, "busCodeLengths": [3, 4],
+                         "gmbCodes": "separate-4-char"},
+              "operators": operators_output, "unmatched": unmatched,
+              "alignment": {op: dict(row) for op, row in alignment_stats.items()}}
+    return {"stops": final_stops, "routeStop": variants, "index": index_payload,
+            "stop_routes": stop_routes, "nearby": nearby, "operator_map": output,
+            "state": registry.state(), "unmatched": unmatched,
+            "alignment": alignment_stats, "mergedGroups": merged,
+            "ambiguousTd": len(ambiguous_td)}
 
 
 def company_ids(previous_map, code):
@@ -320,31 +894,18 @@ def company_ids(previous_map, code):
     return sorted(rows)
 
 
-def merge_deprecated_report(previous_text, rows):
-    """Keep earlier findings, refresh the ones seen in this round."""
+def merge_deprecated_report(previous, rows):
     merged = {}
-    for line in (previous_text or "").splitlines():
+    for line in (previous or "").splitlines():
         line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        code = line.split("|", 1)[0].strip()
-        if code:
-            merged[code] = line
+        if line and not line.startswith("#") and line.split("|", 1)[0].strip():
+            merged[line.split("|", 1)[0].strip()] = line
     for code, row in rows.items():
-        cells = [
-            code,
-            row["td"] or "-",
-            (row["en"] or "-").replace("|", "/"),
-            (row["zh"] or "-").replace("|", "/"),
-            ",".join(row["companies"]) or "-",
-        ]
-        merged[code] = " | ".join(cells)
+        merged[code] = " | ".join([code, row["td"] or "-",
+            (row["en"] or "-").replace("|", "/"), (row["zh"] or "-").replace("|", "/"),
+            ",".join(row["companies"]) or "-"])
     return merged
 
-
-# --------------------------------------------------------------------------
-# main
-# --------------------------------------------------------------------------
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
@@ -353,143 +914,120 @@ def main(argv=None):
     parser.add_argument("--overrides", default="overrides/operator_stops.json")
     parser.add_argument("--operators", default=",".join(OPERATORS))
     parser.add_argument("--version", default="")
-    parser.add_argument("--previous-dir", default="",
-                        help="local directory with the previous round outputs")
+    parser.add_argument("--previous-dir", default="")
     parser.add_argument("--remote-base", default=REMOTE_BASE)
-    parser.add_argument("--offline", action="store_true",
-                        help="do not read the previous round from GitHub")
+    parser.add_argument("--offline", action="store_true")
     args = parser.parse_args(argv)
-
     started = datetime.now(timezone.utc)
-    stops_path = os.path.join(args.static, "stops.json")
-    if not os.path.isfile(stops_path):
-        raise SystemExit("missing %s: run build_static.py first" % stops_path)
-    with open(stops_path, encoding="utf-8") as handle:
-        stops_payload = json.load(handle)
 
-    index = StopIndex(stops_payload)
-    log("indexed %d bus stops" % len(index.records))
+    required = ("stops.json", "routeStop.json", "index.json")
+    payloads = {}
+    for name in required:
+        path = os.path.join(args.static, name)
+        if not os.path.isfile(path):
+            raise SystemExit("missing %s: run build_static.py first" % path)
+        payloads[name] = load_json(path)
+    stops_payload, variants, index_payload = (payloads[name] for name in required)
+    if not any(key.startswith(TD_PREFIX) for key in stops_payload):
+        raise SystemExit("stops.json is already final; run build_static.py before this pass")
 
-    overrides = {}
-    if os.path.isfile(args.overrides):
-        with open(args.overrides, encoding="utf-8") as handle:
-            overrides = json.load(handle)
-        log("loaded overrides for %s" % ", ".join(sorted(overrides)))
-    elif args.overrides:
-        log("no overrides file at %s (optional)" % args.overrides)
-
-    wanted = [name.strip().upper() for name in args.operators.split(",") if name.strip()]
-    operators = {}
-    unmatched = {}
-    issues = {}
-    for name in wanted:
-        fetcher = FETCHERS.get(name)
-        if fetcher is None:
-            raise SystemExit("unknown operator: %s" % name)
-        log("fetching %s stops" % name)
-        operator_stops, problems = fetcher()
-        log("  %s stops=%d issues=%d" % (name, len(operator_stops), len(problems)))
-        result, missing = match_operator(
-            name, operator_stops, index, overrides.get(name) or {})
-        operators[name] = result
-        unmatched[name] = missing
-        if problems:
-            issues[name] = problems[:50]
-        log("  %s matched=%d/%d (%.1f%%)" % (
-            name, result["matched"], result["count"], result["ratio"] * 100))
-
-    version = args.version or "v" + started.strftime("%Y%m%d-%H%M")
-    output = {
-        "version": version,
-        "generatedAt": started.isoformat(timespec="seconds"),
-        "params": {
-            "radiusM": MATCH_RADIUS,
-            "autoAcceptM": AUTO_ACCEPT,
-            "nameMin": NAME_MIN,
-            "nameMinFar": 0.5,
-        },
-        "operators": operators,
-        "unmatched": unmatched,
-        "issues": issues,
-    }
-
-    out_path = args.out or os.path.join(args.static, "operator_map.json")
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    with open(out_path + ".tmp", "w", encoding="utf-8", newline="\n") as handle:
-        json.dump(output, handle, ensure_ascii=False, sort_keys=True,
-                  separators=(",", ":"))
-    os.replace(out_path + ".tmp", out_path)
-
-    # Deprecated stops: published last round, no longer served by any route.
-    # Their codes stay reserved in __stops.json and are reported for review.
     remote_base = "" if args.offline else args.remote_base
-    previous_stops = previous_json(
-        "stops.json", args.previous_dir, remote_base) or {}
-    previous_map = previous_json(
-        "operator_map.json", args.previous_dir, remote_base) or {}
-    previous_report = previous_text(
-        "deprecated_stop.txt", args.previous_dir, remote_base)
+    previous_state = previous_json("__stop_codes.json", args.previous_dir, remote_base) or {}
+    previous_stops = previous_json("stops.json", args.previous_dir, remote_base) or {}
+    previous_map = previous_json("operator_map.json", args.previous_dir, remote_base) or {}
+    previous_td_map = previous_json("__stops.json", args.previous_dir, remote_base) or {}
+    previous_td_codes = {str(td): code for td, code in previous_td_map.items()}
+    if previous_stops:
+        previous_td_codes.update({str(row["td"]): code for code, row in previous_stops.items()
+                                  if row.get("mode") == "bus" and row.get("td")})
 
+    overrides = load_json(args.overrides) if args.overrides and os.path.isfile(args.overrides) else {}
+    wanted = [name.strip().upper() for name in args.operators.split(",") if name.strip()]
+    native_stops, native_routes, issues = {}, {}, {}
+    for operator in wanted:
+        if operator not in FETCHERS:
+            raise SystemExit("unknown operator: %s" % operator)
+        log("fetching %s stops" % operator)
+        native_stops[operator], problems = FETCHERS[operator]()
+        if problems:
+            issues[operator] = problems[:50]
+        log("  %s native stops=%d" % (operator, len(native_stops[operator])))
+        if operator in ROUTE_FETCHERS:
+            log("fetching %s route sequences" % operator)
+            native_routes[operator], problems = ROUTE_FETCHERS[operator]()
+            if problems:
+                issues[operator + "_routes"] = problems[:50]
+            log("  %s route sequences=%d" % (operator, len(native_routes[operator])))
+
+    result = assemble(args, stops_payload, variants, index_payload, native_stops,
+                      native_routes, previous_state, previous_stops, previous_map,
+                      previous_td_codes, overrides, started)
+    out = args.static
+    names = ("stops.json", "routeStop.json", "index.json", "stop_routes.json",
+             "nearby.json", "operator_map.json")
+    for name in names:
+        key = "operator_map" if name == "operator_map.json" else name[:-5]
+        write_json(os.path.join(out, name), result[key])
+    write_json(os.path.join(out, "__stop_codes.json"), result["state"])
+    if args.out:
+        write_json(args.out, result["operator_map"])
+
+    # Deprecated public codes remain reserved in the native state file.
+    current_stops = result["stops"]
     deprecated = {}
     for code, record in previous_stops.items():
-        if code in stops_payload:
-            continue
-        deprecated[code] = {
-            "code": code,
-            "td": str(record.get("td") or ""),
-            "en": record.get("en") or "",
-            "zh": record.get("zh") or "",
-            "companies": company_ids(previous_map, code),
-        }
-    for code, row in sorted(deprecated.items()):
-        log("  deprecated %s %s (%s)" % (
-            code, row["en"], ",".join(row["companies"]) or "-"))
-
+        if code not in current_stops:
+            deprecated[code] = {"code": code, "td": str(record.get("td") or ""),
+                "en": record.get("en") or "", "zh": record.get("zh") or "",
+                "companies": company_ids(previous_map, code)}
+    previous_report = previous_text("deprecated_stop.txt", args.previous_dir, remote_base)
     lines = merge_deprecated_report(previous_report, deprecated)
-    report_path = os.path.join(args.static, "deprecated_stop.txt")
+    report_path = os.path.join(out, "deprecated_stop.txt")
     with open(report_path, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write("# eta6 deprecated stops -- codes stay reserved in __stops.json\n")
+        handle.write("# eta6 deprecated stops -- codes stay reserved\n")
         handle.write("# code | td stop id | name_en | name_zh | operator stop ids\n")
         for code in sorted(lines):
             handle.write(lines[code] + "\n")
 
-    # Fold the stats into manifest.json instead of publishing another file.
-    manifest_path = os.path.join(args.static, "manifest.json")
-    if os.path.isfile(manifest_path):
-        with open(manifest_path, encoding="utf-8") as handle:
-            manifest = json.load(handle)
-        with open(out_path, "rb") as handle:
+    manifest_path = os.path.join(out, "manifest.json")
+    manifest = load_json(manifest_path) if os.path.isfile(manifest_path) else {}
+    manifest.setdefault("counts", {}).update({
+        "stops": len(current_stops),
+        "busStops": sum(row.get("mode") == "bus" for row in current_stops.values()),
+        "gmbStops": sum(row.get("mode") == "gmb" for row in current_stops.values()),
+        "nearbyPairs": sum(len(rows) for rows in result["nearby"].values()),
+        "variants": len(variants)})
+    manifest["routeStop"] = {"path": "routeStop.json", "count": len(variants)}
+    manifest["operatorMap"] = {
+        "path": "operator_map.json", "params": result["operator_map"]["params"],
+        "operators": {name: {key: value for key, value in row.items() if key != "stops"}
+                      for name, row in result["operator_map"]["operators"].items()},
+        "unmatchedCounts": {name: len(rows) for name, rows in result["unmatched"].items()},
+        "alignment": result["operator_map"]["alignment"], "issues": issues}
+    manifest["stopCodes"] = {"path": "__stop_codes.json", "model": "native-pole",
+        "activeNativePoles": sum(row["count"] for row in result["operator_map"]["operators"].values()),
+        "groups": len(result["state"]["groups"]), "tdOnly": len(result["state"]["tdCodes"]),
+        "reserved": len(result["state"]["reserved"]),
+        "crossCompanyMerges": result["mergedGroups"],
+        "ambiguousTdLocations": result["ambiguousTd"],
+        "threeCharacterCapacity": BUS_3_CAPACITY,
+        "overflow": "automatic 4-character allocation; collisions skipped"}
+    manifest["deprecatedStops"] = {"path": "deprecated_stop.txt", "count": len(lines)}
+    for name in names + ("__stop_codes.json", "deprecated_stop.txt"):
+        path = os.path.join(out, name)
+        with open(path, "rb") as handle:
             body = handle.read()
-        manifest.setdefault("files", {})["operator_map.json"] = {
-            "bytes": len(body),
-            "sha256": hashlib.sha256(body).hexdigest(),
-        }
-        with open(report_path, "rb") as handle:
-            report_body = handle.read()
-        manifest["files"]["deprecated_stop.txt"] = {
-            "bytes": len(report_body),
-            "sha256": hashlib.sha256(report_body).hexdigest(),
-        }
-        manifest["deprecatedStops"] = {
-            "path": "deprecated_stop.txt",
-            "count": len(lines),
-        }
-        manifest["operatorMap"] = {
-            "path": "operator_map.json",
-            "params": output["params"],
-            "operators": {
-                name: {key: value for key, value in result.items() if key != "stops"}
-                for name, result in operators.items()
-            },
-            "unmatchedCounts": {name: len(rows) for name, rows in unmatched.items()},
-            "issues": issues,
-        }
-        with open(manifest_path + ".tmp", "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(manifest, handle, ensure_ascii=False, sort_keys=True,
-                      separators=(",", ":"))
-        os.replace(manifest_path + ".tmp", manifest_path)
+        manifest.setdefault("files", {})[name] = {
+            "bytes": len(body), "sha256": hashlib.sha256(body).hexdigest()}
+    write_json(manifest_path, manifest)
 
-    log("wrote %s" % os.path.abspath(out_path))
+    for operator, row in result["operator_map"]["operators"].items():
+        log("  %s coded=%d TD-linked=%d/%d (%.1f%%)" % (
+            operator, row["matched"], row["tdLinked"], row["count"], row["tdRatio"] * 100))
+    log("native groups=%d TD-only=%d merges=%d ambiguous TD=%d" % (
+        len(result["state"]["groups"]), len(result["state"]["tdCodes"]),
+        result["mergedGroups"], result["ambiguousTd"]))
+    log("wrote native-pole dataset -> %s" % os.path.abspath(out))
     return 0
 
 

@@ -34,6 +34,7 @@ ALPHABET_SIZE = len(ALPHABET)  # 34
 
 BUS_CODE_LEN = 3
 GMB_CODE_LEN = 4
+TD_PREFIX = "TD:"  # intermediate bus key; replaced by build_operator_map.py
 
 INCLUDED_AGENCIES = {
     "KMB", "LWB", "CTB", "NLB", "LRTFeeder", "GMB", "KMB+CTB", "LWB+CTB",
@@ -711,18 +712,26 @@ def main(argv=None):
 
     remote_base = "" if args.offline else args.remote_base
     previous_map = previous_json("__stops.json", args.previous_dir, remote_base)
-    if not previous_map:
-        # First round, or no mapper yet: rebuild it from the previous stops.
-        previous_stops = previous_json("stops.json", args.previous_dir, remote_base)
-        if previous_stops:
-            previous_map = {record["td"]: code
-                            for code, record in previous_stops.items()
-                            if record.get("td")}
-    stop_mapper = StopMapper(previous_map or {})
-    if previous_map:
-        log("  stop mapper loaded (%d codes)" % len(previous_map))
+    previous_stops = previous_json("stops.json", args.previous_dir, remote_base)
+    if previous_stops:
+        # Bus codes now belong to native operator poles and are restored by
+        # build_operator_map.py.  This mapper only reserves minibus codes.
+        previous_gmb = {
+            str(record["td"]): code
+            for code, record in previous_stops.items()
+            if record.get("mode") == "gmb" and record.get("td")
+        }
     else:
-        log("  no previous stop mapper: allocating fresh codes")
+        # Legacy fallback: before the native-pole model only GMB used 4 chars.
+        previous_gmb = {
+            str(td): code for td, code in (previous_map or {}).items()
+            if len(code) == GMB_CODE_LEN
+        }
+    stop_mapper = StopMapper(previous_gmb)
+    if previous_gmb:
+        log("  GMB stop mapper loaded (%d codes)" % len(previous_gmb))
+    else:
+        log("  no previous GMB stop mapper: allocating fresh codes")
 
     previous_variants = previous_json(
         "routeStop.json", args.previous_dir, remote_base) or {}
@@ -739,12 +748,18 @@ def main(argv=None):
     new_codes = 0
     for stop_id in sorted(used_stops):
         mode = "bus" if "bus" in used_stops[stop_id] else "gmb"
-        code, created = stop_mapper.allocate(mode, stop_id)
+        if mode == "gmb":
+            code, created = stop_mapper.allocate(mode, stop_id)
+            new_codes += int(created)
+        else:
+            # Native poles, not TD location groups, receive public bus codes in
+            # phase 2.  A prefixed TD key keeps this intermediate unambiguous.
+            code = TD_PREFIX + stop_id
         codes_by_td[stop_id] = code
         modes[stop_id] = mode
-        new_codes += int(created)
-    reserved = stop_mapper.reserved(set(codes_by_td))
-    log("  stops coded=%d new=%d reserved=%d" % (
+    active_gmb = {td for td, mode in modes.items() if mode == "gmb"}
+    reserved = stop_mapper.reserved(active_gmb)
+    log("  TD stops=%d GMB codes new=%d reserved=%d" % (
         len(codes_by_td), new_codes, len(reserved)))
 
     # Route-number collisions (GMB districts, TD service-type splits) require
@@ -954,7 +969,8 @@ def main(argv=None):
     # One file for every variant keeps the publish list manageable.
     emit(os.path.join(out, "routeStop.json"), variants)
 
-    # Public stop mapper: read back at the start of the next round.
+    # GMB reservations stay here; native bus-pole groups are published
+    # separately as __stop_codes.json by build_operator_map.py.
     emit(os.path.join(out, "__stops.json"), stop_mapper.mapping)
 
     report = {
@@ -975,7 +991,10 @@ def main(argv=None):
     before = previous_manifest.get("counts") or {}
     if before:
         deltas = {}
+        native_previous = (previous_manifest.get("stopCodes") or {}).get("model") == "native-pole"
         for key, value in manifest["counts"].items():
+            if native_previous and key in ("stops", "busStops", "nearbyPairs"):
+                continue  # phase 2 expands TD locations into native poles
             old = before.get(key, 0)
             if old and abs(value - old) > max(5, old * 0.1):
                 deltas[key] = {"previous": old, "current": value}
