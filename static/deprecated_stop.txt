@@ -1,0 +1,2 @@
+# eta6 deprecated stops -- codes stay reserved in __stops.json
+# code | td stop id | name_en | name_zh | operator stop ids
