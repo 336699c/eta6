@@ -21,6 +21,13 @@ jobs:
       - name: Check out repository code
         uses: actions/checkout@v4
 
+      - name: Check out previous published build
+        uses: actions/checkout@v4
+        with:
+          ref: data
+          path: previous
+          fetch-depth: 1
+
       - name: Setup Python environment
         uses: actions/setup-python@v5
         with:
@@ -32,14 +39,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # The previous round is read from raw.githubusercontent.com inside the
-      # scripts (stop mapper, variant ids, deprecation report). Nothing from
-      # state/ is committed or uploaded; the maps are rebuilt every run.
+      # Reuse the previous published build for stable variant IDs, GMB/native
+      # stop codes, reserved codes, and deprecation history. Offline mode makes
+      # both stages use this checked-out state instead of remote state lookups.
 
       - name: Build static core
         run: |
           python build_static.py \
             --out static \
+            --previous-dir previous/static \
+            --offline \
             --valid-from "$(date -u +%F)"
 
       - name: Merge identical routes
@@ -50,6 +59,8 @@ jobs:
         run: |
           python build_operator_map.py \
             --static static \
+            --previous-dir previous/static \
+            --offline \
             --overrides overrides/operator_stops.json
 
       - name: Publish to data branch
