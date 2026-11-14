@@ -1,0 +1,70 @@
+name: Build static data
+
+on:
+  schedule:
+    # Sunday and Wednesday 02:00 Hong Kong time (18:00 UTC Sat/Tue).
+    - cron: "0 18 * * 6,2"
+  workflow_dispatch:
+
+# Shares the group with onload.yml: only one writer on the data branch at a time.
+concurrency:
+  group: eta6-data
+  cancel-in-progress: false
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Setup Python environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: 'x64'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # The previous round is read from raw.githubusercontent.com inside the
+      # scripts (stop mapper, variant ids, deprecation report). Nothing from
+      # state/ is committed or uploaded; the maps are rebuilt every run.
+
+      - name: Build static core
+        run: |
+          python build_static.py \
+            --out static \
+            --valid-from "$(date -u +%F)"
+
+      - name: Merge identical routes
+        run: |
+          python merge_routes.py --static static
+
+      - name: Build operator stop map
+        run: |
+          python build_operator_map.py \
+            --static static \
+            --overrides overrides/operator_stops.json
+
+      - name: Publish to data branch
+        uses: test-room-7/action-update-file@v1
+        with:
+          file-path: |
+            static/manifest.json
+            static/index.json
+            static/routeStop.json
+            static/stops.json
+            static/stop_routes.json
+            static/nearby.json
+            static/operator_map.json
+            static/__stops.json
+            static/deprecated_stop.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          commit-msg: Static data | TD GTFS build
+          branch: data
