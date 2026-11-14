@@ -1,0 +1,5 @@
+.cache/
+static/
+state/
+__pycache__/
+*.pyc
