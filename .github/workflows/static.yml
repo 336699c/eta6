@@ -1,7 +1,7 @@
 name: Build static data
 
 on:
-  onload:
+  push:
   schedule:
     # Sunday and Wednesday 02:00 Hong Kong time (18:00 UTC Sat/Tue).
     - cron: "0 18 * * 6,2"
