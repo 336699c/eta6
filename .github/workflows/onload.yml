@@ -1,7 +1,6 @@
 name: Update resources
 
 on:
-  push:
   schedule:
     - cron: "30 13 * * 6"
   workflow_dispatch:
