@@ -136,6 +136,47 @@ def parse_tagged_name(raw):
     return clean_text(chosen), operator_names
 
 
+def stop_name(record, lang="en"):
+    """Canonical display name, accepting old string and new nested maps."""
+    value = record.get(lang)
+    if isinstance(value, dict):
+        if value.get("default"):
+            return value["default"]
+        for name in value.values():
+            if name:
+                return name
+        return ""
+    return value or ""
+
+
+def stop_company_names(record):
+    value = record.get("en")
+    if isinstance(value, dict):
+        return {key: name for key, name in value.items()
+                if key != "default" and name}
+    return dict(record.get("ops") or {})
+
+
+def nested_names(value, fallback=""):
+    if isinstance(value, dict):
+        names = {key: name for key, name in value.items() if name}
+    elif value:
+        names = {"default": value}
+    else:
+        names = {}
+    if not names.get("default"):
+        names["default"] = fallback or next(iter(names.values()), "")
+    return names
+
+
+def stop_td_ids(record):
+    values = record.get("tds")
+    if values:
+        return {str(value) for value in values}
+    td = record.get("td")
+    return {str(td)} if td else set()
+
+
 def normalize_name(value):
     value = value.upper()
     value = re.sub(r"\(.*?\)", " ", value)
@@ -301,10 +342,12 @@ def load_stops(en_dir, tc_dir):
     stops = {}
     for row in read_csv(os.path.join(en_dir, "stops.txt")):
         name, operator_names = parse_tagged_name(row["stop_name"])
+        en_names = {"default": name}
+        en_names.update({operator: value for operator, value in operator_names.items()
+                         if value})
         stops[row["stop_id"]] = {
-            "en": name,
-            "zh": "",
-            "ops": operator_names,
+            "en": en_names,
+            "zh": {"default": ""},
             "loc": [float(row["stop_lat"]), float(row["stop_lon"])],
         }
     for row in read_csv(os.path.join(tc_dir, "stops.txt")):
@@ -312,9 +355,10 @@ def load_stops(en_dir, tc_dir):
         if record is None:
             continue
         name, operator_names = parse_tagged_name(row["stop_name"])
-        record["zh"] = name
-        for operator, value in operator_names.items():
-            record["ops"].setdefault(operator, value)
+        zh_names = {"default": name}
+        zh_names.update({operator: value for operator, value in operator_names.items()
+                         if value})
+        record["zh"] = zh_names
     return stops
 
 
@@ -619,31 +663,57 @@ def build_nearby(codes_by_td, stops, stop_routes):
     cell = 0.002
     grid = defaultdict(list)
     points = []
+    td_codes = defaultdict(set)
     for td_id in codes_by_td:
         record = stops.get(td_id)
         if record is None:
             continue
-        entry = (codes_by_td[td_id], record["loc"], record)
+        code = codes_by_td[td_id]
+        entry = (code, record["loc"], record)
         points.append(entry)
         grid[(int(record["loc"][0] / cell), int(record["loc"][1] / cell))].append(entry)
+        for td in stop_td_ids(record):
+            td_codes[td].add(code)
 
+    by_code = {code: (loc, record) for code, loc, record in points}
     nearby = {}
     for code, loc, record in points:
         row_key, col_key = int(loc[0] / cell), int(loc[1] / cell)
+        td_ids = stop_td_ids(record)
+        alias_codes = set()
+        for td in td_ids:
+            alias_codes.update(td_codes.get(td, ()))
+        alias_codes.discard(code)
+
         candidates = []
+        seen = set(alias_codes)
         for dr in (-1, 0, 1):
             for dc in (-1, 0, 1):
                 for other_code, other_loc, other in grid[(row_key + dr, col_key + dc)]:
-                    if other_code == code:
+                    if other_code == code or other_code in seen:
                         continue
                     dist = distance_m(loc, other_loc)
                     if dist <= NEARBY_RADIUS:
                         candidates.append((dist, other_code, other))
+                        seen.add(other_code)
         candidates.sort(key=lambda item: item[0])
+
+        selected = []
+        for other_code in alias_codes:
+            other_loc, other = by_code[other_code]
+            selected.append((distance_m(loc, other_loc), other_code, other, True))
+        limit = max(NEARBY_LIMIT, len(selected))
+        for dist, other_code, other in candidates:
+            if len(selected) >= limit:
+                break
+            selected.append((dist, other_code, other, False))
+        selected.sort(key=lambda item: item[0])
+
         keys = set(stop_routes.get(code, []))
+        same_name = stop_name(record, "en")
         rows = []
-        for dist, other_code, other in candidates[:NEARBY_LIMIT]:
-            same = normalize_name(record["en"]) == normalize_name(other["en"]) != ""
+        for dist, other_code, other, same_stop in selected:
+            same = normalize_name(same_name) == normalize_name(stop_name(other, "en")) != ""
             shared = bool(keys & set(stop_routes.get(other_code, [])))
             flags = 0
             if same:
@@ -652,6 +722,8 @@ def build_nearby(codes_by_td, stops, stop_routes):
                 flags |= 2
             if (record.get("mode") != other.get("mode")):
                 flags |= 4
+            if same_stop:
+                flags |= 8
             rows.append([other_code, int(round(dist)), int(round(dist / WALK_SPEED)), flags])
         if rows:
             nearby[code] = rows
@@ -772,7 +844,8 @@ def main(argv=None):
         for position, route_id in enumerate(sorted(ids)):
             group_ordinal[route_id] = position + 1
 
-    stop_names_en = {stop_id: record["en"] for stop_id, record in stops.items()}
+    stop_names_en = {stop_id: stop_name(record, "en")
+                     for stop_id, record in stops.items()}
 
     variants = {}
     route_index = {}
@@ -871,15 +944,15 @@ def main(argv=None):
         if not (LAT_RANGE[0] <= lat <= LAT_RANGE[1]
                 and LON_RANGE[0] <= lon <= LON_RANGE[1]):
             warnings.append("stop %s outside HK bounds: %s" % (code, record["loc"]))
+        en_names = nested_names(record.get("en"))
+        zh_names = nested_names(record.get("zh"), en_names["default"])
         entry = {
             "td": stop_id,
             "mode": modes[stop_id],
-            "en": record["en"],
-            "zh": record["zh"] or record["en"],
+            "en": en_names,
+            "zh": zh_names,
             "loc": [round(lat, 5), round(lon, 5)],
         }
-        if record["ops"]:
-            entry["ops"] = record["ops"]
         stop_payload[code] = entry
 
     log("building nearby pairs")

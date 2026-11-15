@@ -29,8 +29,9 @@ from build_static import (ALPHABET, ALPHABET_SIZE, BUS_CODE_LEN, GMB_CODE_LEN,
                           LAT_RANGE, LON_RANGE, NEARBY_LIMIT, NEARBY_RADIUS,
                           REMOTE_BASE, TD_PREFIX, WALK_SPEED, VariantIdMapper,
                           build_nearby, code_from_index, distance_m,
-                          index_from_code, name_score, previous_json,
-                          previous_text, route_slug, write_json)
+                          index_from_code, name_score, nested_names, previous_json,
+                          previous_text, route_slug, stop_company_names, stop_name,
+                          write_json)
 from util import get_json, get_req
 
 KMB_STOP_URL = "https://data.etabus.gov.hk/v1/transport/kmb/stop/"
@@ -261,7 +262,7 @@ class StopIndex:
                         rows.append((dist, key, record))
         if override is None:
             tagged = [row for row in rows if OPERATOR_TAGS[operator]
-                      & set((row[2].get("ops") or {}).keys())]
+                      & set(stop_company_names(row[2]))]
             rows = tagged or rows
         result = []
         for dist, key, record in rows:
@@ -269,7 +270,8 @@ class StopIndex:
                 result.append({"td": str(record["td"]), "d": round(dist, 1),
                                "c": 1.0, "m": "override", "q": 1.0})
                 continue
-            names = [record.get("en") or ""] + list((record.get("ops") or {}).values())
+            names = [stop_name(record, "en")]
+            names.extend(stop_company_names(record).values())
             similarity = max(name_score(stop["en"], name) for name in names)
             quality = 0.65 * similarity + 0.35 * (1.0 - dist / MATCH_RADIUS)
             accepted = (dist <= AUTO_ACCEPT or
@@ -593,7 +595,7 @@ def safe_cross_company_pairs(alignments, variants, links, native_stops, stops_pa
                   if row.get("mode") == "bus"}
     for td, by_operator in by_td.items():
         record = td_records.get(td) or {}
-        if not ({"KMB+CTB", "LWB+CTB"} & set((record.get("ops") or {}).keys())):
+        if not ({"KMB+CTB", "LWB+CTB"} & set(stop_company_names(record))):
             continue
         if any(len(stop_ids) != 1 for stop_ids in by_operator.values()):
             continue
@@ -994,12 +996,20 @@ def assemble(args, stops_payload, variants, index_payload, native_stops,
         first_operator, first_stop = sorted(active.items())[0]
         native_record = native_stops[first_operator][first_stop]
         source = td_record or native_record
+        en_names = nested_names(source.get("en"), native_record["en"])
+        zh_names = nested_names(source.get("zh"),
+                                native_record["zh"] or native_record["en"])
+        for operator, stop_id in active.items():
+            native = native_stops[operator][stop_id]
+            tag = "LRTFeeder" if operator == "MTR" else operator
+            if native.get("en"):
+                en_names.setdefault(tag, native["en"])
+            if native.get("zh") or native.get("en"):
+                zh_names.setdefault(tag, native.get("zh") or native["en"])
         entry = {"td": primary_td or "", "tds": tds, "mode": "bus",
-                 "en": source.get("en") or native_record["en"],
-                 "zh": source.get("zh") or source.get("en") or native_record["zh"],
-                 "loc": [round(native_record["loc"][0], 5), round(native_record["loc"][1], 5)]}
-        if source.get("ops"):
-            entry["ops"] = source["ops"]
+                 "en": en_names, "zh": zh_names,
+                 "loc": [round(native_record["loc"][0], 5),
+                         round(native_record["loc"][1], 5)]}
         final_stops[code] = entry
     for td, code in td_only_codes.items():
         entry = dict(td_records[td])
@@ -1269,7 +1279,7 @@ def main(argv=None):
     for code, record in previous_stops.items():
         if code not in current_stops:
             deprecated[code] = {"code": code, "td": str(record.get("td") or ""),
-                "en": record.get("en") or "", "zh": record.get("zh") or "",
+                "en": stop_name(record, "en"), "zh": stop_name(record, "zh"),
                 "companies": company_ids(previous_map, code)}
     previous_report = previous_text("deprecated_stop.txt", args.previous_dir, remote_base)
     lines = merge_deprecated_report(previous_report, deprecated)
