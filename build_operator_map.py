@@ -57,6 +57,7 @@ GRID_CELL = 0.002
 MATCH_RADIUS = 80.0
 AUTO_ACCEPT = 15.0
 NAME_MIN = 0.34
+GAP_FILL_QUALITY = 0.8
 NLB_WORKERS = 6
 KMB_ROUTE_WORKERS = 8
 BUS_3_CAPACITY = ALPHABET_SIZE ** BUS_CODE_LEN
@@ -126,6 +127,17 @@ def fetch_ctb():
     return stops, issues
 
 
+_NLB_CACHE = {}
+_MTR_BODY = None
+
+
+def _nlb_payload(route_id):
+    key = str(route_id)
+    if key not in _NLB_CACHE:
+        _NLB_CACHE[key] = get_json(NLB_STOP_URL % key)
+    return _NLB_CACHE[key]
+
+
 def fetch_nlb():
     payload = get_json(NLB_ROUTE_URL)
     routes = payload.get("routes") or payload.get("data") or []
@@ -134,7 +146,7 @@ def fetch_nlb():
 
     def load(route_id):
         try:
-            data = get_json(NLB_STOP_URL % route_id)
+            data = _nlb_payload(route_id)
         except RuntimeError as exc:
             return [], ["route %s: %s" % (route_id, exc)]
         rows, problems = [], []
@@ -158,10 +170,16 @@ def fetch_nlb():
     return stops, issues
 
 
+def _mtr_rows():
+    global _MTR_BODY
+    if _MTR_BODY is None:
+        _MTR_BODY = get_req(MTR_STOP_URL).decode("utf-8-sig", errors="replace")
+    return csv.DictReader(io.StringIO(_MTR_BODY))
+
+
 def fetch_mtr():
-    body = get_req(MTR_STOP_URL).decode("utf-8-sig", errors="replace")
     stops, issues = {}, []
-    for row in csv.DictReader(io.StringIO(body)):
+    for row in _mtr_rows():
         stop_id = (row.get("STATION_ID") or "").strip()
         if not stop_id:
             continue
@@ -222,15 +240,103 @@ def fetch_ctb_routes():
         for bound in ("I", "O"):
             item = row.get(bound) or {}
             stops = [str(stop) for stop in item.get("stops") or [] if stop]
-            if stops:
-                routes.append({"route": str(number), "bound": bound, "serviceType": "1",
-                               "orig": bilingual(item.get("orig_en"), item.get("orig_tc")),
-                               "dest": bilingual(item.get("dest_en"), item.get("dest_tc")),
-                               "stops": stops})
+            if not stops:
+                continue
+            # CTB publishes no service type. Its service shape is inferred from
+            # the sequence it supplies: a repeated terminal means a loop, and
+            # the bound distinguishes the two directions. Nothing is assumed
+            # per route number.
+            routes.append({"route": str(number), "bound": bound, "serviceType": None,
+                           "loop": len(stops) > 1 and stops[0] == stops[-1],
+                           "orig": bilingual(item.get("orig_en"), item.get("orig_tc")),
+                           "dest": bilingual(item.get("dest_en"), item.get("dest_tc")),
+                           "stops": stops})
     return routes, []
 
 
 ROUTE_FETCHERS = {"KMB": fetch_kmb_routes, "CTB": fetch_ctb_routes}
+
+
+def fetch_nlb_routes():
+    """NLB supplies one row per direction plus its own overnight/special flags.
+
+    The bound is inferred from the operator's own sequences: when two rows of
+    one route are reverses of each other the first is outbound and the second
+    inbound. No route number is special-cased.
+    """
+    payload = get_json(NLB_ROUTE_URL)
+    rows = payload.get("routes") or payload.get("data") or []
+    built, issues = [], []
+    for row in rows:
+        route_id = row.get("routeId")
+        number = str(row.get("routeNo") or "").strip()
+        if route_id is None or not number:
+            continue
+        try:
+            data = _nlb_payload(route_id)
+        except RuntimeError as exc:
+            issues.append("route %s: %s" % (route_id, exc))
+            continue
+        stops = [str(item.get("stopId") or "").strip() for item in data.get("stops") or []]
+        stops = [stop for stop in stops if stop]
+        if len(stops) < 2:
+            continue
+        name_en = str(row.get("routeName_e") or "")
+        name_zh = str(row.get("routeName_c") or "")
+        orig_en, _, dest_en = name_en.partition(">")
+        orig_zh, _, dest_zh = name_zh.partition(">")
+        if int(row.get("specialRoute") or 0):
+            service = "special"
+        elif int(row.get("overnightRoute") or 0):
+            service = "overnight"
+        else:
+            service = None
+        built.append({"route": number, "bound": "O", "serviceType": service,
+                      "loop": len(stops) > 1 and stops[0] == stops[-1],
+                      "orig": bilingual(orig_en.strip(), orig_zh.strip()),
+                      "dest": bilingual(dest_en.strip(), dest_zh.strip()),
+                      "stops": stops})
+    groups = defaultdict(list)
+    for route in built:
+        groups[route["route"]].append(route)
+    for group in groups.values():
+        for position, route in enumerate(group):
+            others = [other for other in group if other is not route]
+            if any(route["stops"] == list(reversed(other["stops"]))
+                   for other in others):
+                route["bound"] = "I" if position else "O"
+    return built, issues
+
+
+def fetch_mtr_routes():
+    """MTR feeder sequences come from the same CSV, ordered by STATION_SEQNO."""
+    groups = defaultdict(list)
+    for row in _mtr_rows():
+        route = (row.get("ROUTE_ID") or "").strip()
+        direction = (row.get("DIRECTION") or "O").strip().upper()
+        stop_id = (row.get("STATION_ID") or "").strip()
+        if not route or not stop_id:
+            continue
+        try:
+            sequence = int(row.get("STATION_SEQNO") or 0)
+        except ValueError:
+            sequence = 0
+        groups[(route, direction)].append((sequence, stop_id))
+    routes = []
+    for (route, direction), items in sorted(groups.items()):
+        items.sort()
+        stops = [stop for _, stop in items]
+        if len(stops) < 2:
+            continue
+        routes.append({"route": route, "bound": "I" if direction == "I" else "O",
+                       "serviceType": None,
+                       "loop": len(stops) > 1 and stops[0] == stops[-1],
+                       "orig": bilingual("", ""), "dest": bilingual("", ""),
+                       "stops": stops})
+    return routes, []
+
+
+ROUTE_FETCHERS.update({"NLB": fetch_nlb_routes, "MTR": fetch_mtr_routes})
 
 
 # --------------------------------------------------------------------------
@@ -337,6 +443,50 @@ def direction_score(variant, route):
             + name_score((variant.get("dest") or {}).get("en", ""), route["dest"]["en"]))
 
 
+def stitched_tracks(routes):
+    """Ordered joins of the opposite bounds of one route.
+
+    TD can publish a loop as a single pattern while the operator publishes its
+    two halves, or a truncated loop pattern that only the pair covers. Joining
+    O and I (either order) gives the alignment a track that follows the
+    operator's own sequences; no route-specific knowledge is involved.
+    """
+    tracks, seen = [], set()
+    for first in routes:
+        for second in routes:
+            if first is second or first["bound"] == second["bound"]:
+                continue
+            # A joined track is only the same service if both bounds carry the
+            # same service type; mixing them would invent a service.
+            if (first.get("serviceType") or "") != (second.get("serviceType") or ""):
+                continue
+            first_stops, second_stops = list(first["stops"]), list(second["stops"])
+            if not first_stops or not second_stops:
+                continue
+            if first_stops[-1] == second_stops[0]:
+                second_stops = second_stops[1:]
+            stops = first_stops + second_stops
+            key = tuple(stops)
+            if key in seen:
+                continue
+            seen.add(key)
+            tracks.append({
+                "route": first["route"],
+                "bound": "%s+%s" % (first["bound"], second["bound"]),
+                "serviceType": first.get("serviceType"),
+                "loop": len(stops) > 1 and stops[0] == stops[-1],
+                "orig": first.get("orig") or {},
+                "dest": second.get("dest") or {},
+                "stops": stops,
+                "segments": [
+                    {"bound": first["bound"], "start": 0, "length": len(first_stops)},
+                    {"bound": second["bound"], "start": len(first_stops),
+                     "length": len(second_stops)},
+                ],
+            })
+    return tracks
+
+
 def align_routes(variants, native_routes, candidates):
     alignments = {}
     stats = defaultdict(lambda: {"variants": 0, "positions": 0})
@@ -345,28 +495,42 @@ def align_routes(variants, native_routes, candidates):
                   if key.startswith(TD_PREFIX)]
         if len(td_ids) < 2 or len(td_ids) != len(variant.get("stops") or []):
             continue  # GMB-only or degenerate variant
+        minimum = min(2, len(td_ids)) if len(td_ids) <= 3 else math.ceil(len(td_ids) * 0.45)
         for agency in variant.get("co") or []:
             operator = AGENCY_OPERATOR.get(agency)
             if operator not in native_routes:
                 continue
+            routes = [route for route in native_routes[operator]
+                      if route["route"] == variant.get("route")]
             best = None
-            for route in native_routes[operator]:
-                if route["route"] != variant.get("route"):
-                    continue
+            for route in routes:
                 aligned = align_sequences(td_ids, route["stops"],
                                           candidates.get(operator, {}))
-                minimum = min(2, len(td_ids)) if len(td_ids) <= 3 else math.ceil(len(td_ids) * 0.45)
                 if aligned["matched"] < minimum:
                     continue
                 rank = (aligned["score"] + direction_score(variant, route),
                         aligned["matched"], -abs(len(td_ids) - len(route["stops"])),
-                        route["bound"], route["serviceType"])
+                        route["bound"], route.get("serviceType") or "")
                 if best is None or rank > best[0]:
                     best = (rank, route, aligned)
+            # A loop or partial loop has no single native sequence that covers
+            # the TD pattern. Try the operator's joined bounds only then.
+            if best is not None and best[2]["matched"] < len(td_ids):
+                for track in stitched_tracks(routes):
+                    aligned = align_sequences(td_ids, track["stops"],
+                                              candidates.get(operator, {}))
+                    if aligned["matched"] < minimum:
+                        continue
+                    rank = (aligned["score"] + direction_score(variant, track),
+                            aligned["matched"], -abs(len(td_ids) - len(track["stops"])),
+                            track["bound"], track.get("serviceType") or "")
+                    if rank > best[0]:
+                        best = (rank, track, aligned)
             if best is not None:
                 alignments.setdefault(variant_id, {})[operator] = {
                     "route": best[1], "pairs": best[2]["pairs"],
-                    "matched": best[2]["matched"], "score": round(best[2]["score"], 3)}
+                    "matched": best[2]["matched"], "score": round(best[2]["score"], 3),
+                    "td_ids": td_ids}
                 stats[operator]["variants"] += 1
                 stats[operator]["positions"] += best[2]["matched"]
     return alignments, stats
@@ -384,13 +548,17 @@ def propagate_coop_alignments(alignments, variants, stats):
             continue
         for target, target_aligned in by_operator.items():
             target_used = {native_index for _, native_index, _ in target_aligned["pairs"]}
+            target_inferred = target_aligned.get("inferred") or set()
             target_at_td = {td_index: native_index
-                            for td_index, native_index, _ in target_aligned["pairs"]}
+                            for td_index, native_index, _ in target_aligned["pairs"]
+                            if (td_index, native_index) not in target_inferred}
             for donor, donor_aligned in by_operator.items():
                 if donor == target:
                     continue
+                donor_inferred = donor_aligned.get("inferred") or set()
                 donor_at_td = {td_index: (native_index, quality)
-                               for td_index, native_index, quality in donor_aligned["pairs"]}
+                               for td_index, native_index, quality in donor_aligned["pairs"]
+                               if (td_index, native_index) not in donor_inferred}
                 shared = [(target_at_td[i], donor_at_td[i][0]) for i in target_at_td
                           if i in donor_at_td]
                 if len(shared) < 2:
@@ -418,9 +586,44 @@ def propagate_coop_alignments(alignments, variants, stats):
     return alignments
 
 
-# --------------------------------------------------------------------------
+def complete_alignments(alignments):
+    """Pair skipped TD positions with unused native stops between anchors.
+
+    The operator's own sequence is authoritative. When the DP skipped a TD
+    position and left a native stop unused inside the same matched interval,
+    the two are bound positionally. Stops outside the chosen sequence are
+    never substituted, so a gap with no native stop stays empty.
+    """
+    added = 0
+    for by_operator in alignments.values():
+        for operator, aligned in by_operator.items():
+            pairs = sorted(aligned["pairs"])
+            td_count = len(aligned["td_ids"])
+            native_count = len(aligned["route"]["stops"])
+            used_td = {index for index, _, _ in pairs}
+            used_native = {index for _, index, _ in pairs}
+            anchors = [(-1, -1)]
+            anchors += [(index, native) for index, native, _ in pairs]
+            anchors.append((td_count, native_count))
+            filled = []
+            for (td_left, native_left), (td_right, native_right) in zip(anchors, anchors[1:]):
+                td_gap = [index for index in range(td_left + 1, td_right)
+                          if index not in used_td]
+                native_gap = [index for index in range(native_left + 1, native_right)
+                              if index not in used_native]
+                for td_index, native_index in zip(td_gap, native_gap):
+                    filled.append((td_index, native_index, GAP_FILL_QUALITY))
+            if filled:
+                aligned["pairs"] = sorted(pairs + filled)
+                aligned["matched"] += len(filled)
+                aligned.setdefault("inferred", set()).update(
+                    (td_index, native_index) for td_index, native_index, _ in filled)
+                added += len(filled)
+    return added
+
+
 # Persistent native codes
-# --------------------------------------------------------------------------
+
 
 class NativeCodeRegistry:
     def __init__(self, state=None, historical_codes=(), collision_codes=(),
@@ -580,7 +783,10 @@ def safe_cross_company_pairs(alignments, variants, links, native_stops, stops_pa
         td_ids = [key[len(TD_PREFIX):] for key in variants[variant_id]["stops"]]
         at_position = defaultdict(dict)
         for operator, aligned in by_operator.items():
+            inferred = aligned.get("inferred") or set()
             for td_index, native_index, _ in aligned["pairs"]:
+                if (td_index, native_index) in inferred:
+                    continue  # positional completion is not co-location evidence
                 stop_id = aligned["route"]["stops"][native_index]
                 at_position[td_index][operator] = stop_id
         for operators in at_position.values():
@@ -721,7 +927,7 @@ def build_native_only_variants(variants, index_payload, native_routes,
                 "bound": route.get("bound"),
                 "tdRouteId": None,
                 "nativeRouteId": "%s:%s:%s:%s" % (
-                    operator, number, route.get("bound"), route.get("serviceType", "")),
+                    operator, number, route.get("bound"), route.get("serviceType") or ""),
                 "stableKey": stable_key,
                 "orig": orig,
                 "dest": dest,
@@ -902,38 +1108,31 @@ def merge_native_only_variants(variants, index_payload, final_stops):
     return stats
 
 
-def annotate_coop_codes(variant):
-    """Mark a co-op variant's per-operator arrays as shared or split.
+def annotate_variant_codes(variant):
+    """Record the positions each operator's own array leaves empty.
 
-    Positions an operator's sequence does not serve are filled with the
-    display code and listed in "unserved" (0-based indices into "stops")
-    instead of being left as null. Single-operator variants keep their
-    legacy arrays untouched.
+    No array is padded or guessed. A position stays null when the operator's
+    own route list has no stop for it, and that null is listed in "unserved"
+    (0-based indices into "stops") so it can be fixed later. Co-op variants
+    also carry "codeMode": "shared" when every operator publishes the same
+    code at every position, "split" when their arrays differ.
     """
     arrays = variant.get("operatorStopCodes") or {}
-    display = variant.get("stops") or []
-    if len(arrays) < 2 or not display:
-        return
-    served = {operator: {i for i, code in enumerate(array) if code}
-              for operator, array in arrays.items()}
-    names = list(arrays)
-    first = names[0]
-    common = set.intersection(*(served[name] for name in names))
-    shared = (bool(common)
-              and all(served[name] == served[first] for name in names)
-              and all(arrays[first][i] == arrays[name][i]
-                      for name in names[1:] for i in common))
     unserved = {}
     for operator, array in arrays.items():
-        missing = [i for i, code in enumerate(array) if not code]
+        missing = [index for index, code in enumerate(array) if not code]
         if missing:
             unserved[operator] = missing
-            for i in missing:
-                array[i] = display[i]
-    variant["codeMode"] = "shared" if shared else "split"
-    variant.pop("unserved", None)
     if unserved:
         variant["unserved"] = unserved
+    else:
+        variant.pop("unserved", None)
+    if len(arrays) < 2:
+        variant.pop("codeMode", None)
+        return
+    values = list(arrays.values())
+    shared = any(values[0]) and all(array == values[0] for array in values[1:])
+    variant["codeMode"] = "shared" if shared else "split"
 
 
 def assemble(args, stops_payload, variants, index_payload, native_stops,
@@ -943,6 +1142,7 @@ def assemble(args, stops_payload, variants, index_payload, native_stops,
         native_stops, StopIndex(stops_payload), overrides, alignments={}, variants=variants)
     # Route alignment is recomputed here with the complete candidate map.
     alignments, alignment_stats = align_routes(variants, native_routes, candidates)
+    complete_alignments(alignments)
     propagate_coop_alignments(alignments, variants, alignment_stats)
     candidates, links, unmatched = build_links(
         native_stops, StopIndex(stops_payload), overrides, alignments, variants)
@@ -1072,17 +1272,11 @@ def assemble(args, stops_payload, variants, index_payload, native_stops,
             variants, index_payload, final_stops)
         for variant in variants.values():
             if is_native_only_variant(variant):
-                annotate_coop_codes(variant)
+                annotate_variant_codes(variant)
 
-    # Route-specific arrays and canonical display codes.
-    td_to_codes = defaultdict(set)
-    for code, tds in code_tds.items():
-        for td in tds:
-            td_to_codes[td].add(code)
-    for td, code in td_only_codes.items():
-        td_to_codes[td].add(code)
-    code_operators = {code: set(group["operators"]) for code, group in registry.groups.items()}
-
+    # Route-specific arrays. A code is published only for a position that the
+    # operator's own sequence covers; everything else stays null and is listed
+    # in "unserved". No display fallback invents a code.
     for variant_id, variant in variants.items():
         if not variant.get("stops") or not variant["stops"][0].startswith(TD_PREFIX):
             continue
@@ -1090,21 +1284,39 @@ def assemble(args, stops_payload, variants, index_payload, native_stops,
         by_operator = alignments.get(variant_id, {})
         agencies = [AGENCY_OPERATOR.get(name) for name in variant.get("co") or []]
         operators = list(dict.fromkeys(op for op in agencies if op in OPERATORS))
-        cooperative = len(operators) > 1
         operator_arrays = {}
         for operator in operators:
             array = [None] * len(td_ids)
             aligned = by_operator.get(operator)
+            trusted = set()
             if aligned:
+                inferred = aligned.get("inferred") or set()
                 for td_index, native_index, _ in aligned["pairs"]:
                     stop_id = aligned["route"]["stops"][native_index]
                     array[td_index] = registry.native_to_code[native_key(operator, stop_id)]
-            if cooperative or any(array):
-                operator_arrays[operator] = array
+                    if (td_index, native_index) not in inferred:
+                        trusted.add(td_index)
+                # A TD loop lists the same stop id at both ends, while the
+                # company may list the pole once. The same company code is the
+                # only 1-to-1 answer for the repeated position, so reuse it
+                # when it came from a real match rather than a positional one.
+                repeats = defaultdict(list)
+                for position, td in enumerate(td_ids):
+                    repeats[td].append(position)
+                for positions in repeats.values():
+                    if len(positions) < 2:
+                        continue
+                    codes = {array[p] for p in positions if array[p] and p in trusted}
+                    if len(codes) == 1:
+                        code = next(iter(codes))
+                        for position in positions:
+                            if not array[position]:
+                                array[position] = code
+            operator_arrays[operator] = array
 
         primary_operator = next((op for op in agencies if op in OPERATORS), None)
         display = []
-        for position, td in enumerate(td_ids):
+        for position in range(len(td_ids)):
             code = None
             if primary_operator in operator_arrays:
                 code = operator_arrays[primary_operator][position]
@@ -1113,13 +1325,6 @@ def assemble(args, stops_payload, variants, index_payload, native_stops,
                     if operator in operator_arrays and operator_arrays[operator][position]:
                         code = operator_arrays[operator][position]
                         break
-            if code is None:
-                choices = sorted(td_to_codes.get(td, ()), key=lambda item: (
-                    not bool(code_operators.get(item, set()) & set(agencies)), item))
-                if choices:
-                    code = choices[0]
-            if code is None:
-                raise RuntimeError("no final code for TD stop %s in %s" % (td, variant_id))
             display.append(code)
         variant["stops"] = display
 
@@ -1127,7 +1332,7 @@ def assemble(args, stops_payload, variants, index_payload, native_stops,
             variant["operatorStopCodes"] = operator_arrays
         else:
             variant.pop("operatorStopCodes", None)
-        annotate_coop_codes(variant)
+        annotate_variant_codes(variant)
 
         primary = by_operator.get(primary_operator)
         if primary:
@@ -1137,16 +1342,36 @@ def assemble(args, stops_payload, variants, index_payload, native_stops,
                        + name_score((variant.get("dest") or {}).get("en", ""), route["orig"]["en"]))
             if reverse > forward and reverse >= 0.5:
                 variant["orig"], variant["dest"] = variant.get("dest"), variant.get("orig")
-            variant["bound"] = route["bound"]
+            if route["bound"] in ("O", "I"):
+                variant["bound"] = route["bound"]
             variant.pop("directionGuessed", None)
             bounds = dict(variant.get("bounds") or {})
             for operator, aligned in by_operator.items():
-                bounds[operator] = aligned["route"]["bound"]
+                # "O+I" is a joined track, not a direction; it is described in
+                # operatorRoutes instead of overwriting the bound map.
+                if aligned["route"]["bound"] in ("O", "I"):
+                    bounds[operator] = aligned["route"]["bound"]
             if len(set(bounds.values())) > 1 or any(
                     bounds.get(op) != variant["bound"] for op in bounds):
                 variant["bounds"] = bounds
             elif "bounds" in variant:
                 del variant["bounds"]
+
+        routes_meta = {}
+        for operator, aligned in by_operator.items():
+            route = aligned["route"]
+            meta = {"bound": route["bound"]}
+            if route.get("serviceType"):
+                meta["serviceType"] = route["serviceType"]
+            if route.get("loop"):
+                meta["loop"] = True
+            if route.get("segments"):
+                meta["segments"] = route["segments"]
+            routes_meta[operator] = meta
+        if routes_meta:
+            variant["operatorRoutes"] = routes_meta
+        else:
+            variant.pop("operatorRoutes", None)
 
     # Refresh index summaries after native direction correction.
     for variant_id, summary in index_payload.get("variants", {}).items():
@@ -1162,9 +1387,12 @@ def assemble(args, stops_payload, variants, index_payload, native_stops,
 
     stop_routes = defaultdict(set)
     for variant_id, variant in variants.items():
-        codes = set(variant.get("stops") or [])
-        for array in (variant.get("operatorStopCodes") or {}).values():
-            codes.update(code for code in array if code)
+        arrays = variant.get("operatorStopCodes") or {}
+        if arrays:
+            codes = {code for array in arrays.values() for code in array if code}
+        else:
+            # Native-only and GMB variants carry their own dense display codes.
+            codes = {code for code in variant.get("stops") or [] if code}
         for code in codes:
             stop_routes[code].add(variant_id)
     stop_routes = {code: sorted(ids) for code, ids in stop_routes.items()}
@@ -1189,21 +1417,37 @@ def assemble(args, stops_payload, variants, index_payload, native_stops,
            if row.get("mode") == "gmb"):
         raise RuntimeError("GMB received a three-character code")
 
-    # Co-op variants must publish dense arrays; absence is explicit.
+    # Arrays are authoritative and sparse: "unserved" must match their nulls
+    # exactly, co-op variants must classify as shared or split, and every
+    # published display code must come from an operator's own array.
     for variant_id, variant in variants.items():
-        if variant.get("codeMode") not in ("shared", "split"):
-            continue
         arrays = variant.get("operatorStopCodes") or {}
+        if not arrays:
+            continue
         display = variant.get("stops") or []
-        if len(arrays) < 2:
-            raise RuntimeError("co-op variant lacks per-operator arrays: %s" % variant_id)
+        unserved = variant.get("unserved") or {}
+        if len(arrays) > 1:
+            if variant.get("codeMode") not in ("shared", "split"):
+                raise RuntimeError("co-op variant lacks codeMode: %s" % variant_id)
+        elif variant.get("codeMode") in ("shared", "split"):
+            raise RuntimeError("single-operator variant has codeMode: %s" % variant_id)
         for operator, array in arrays.items():
-            if len(array) != len(display) or any(not code for code in array):
-                raise RuntimeError("non-dense %s array in %s" % (operator, variant_id))
-        if variant["codeMode"] == "shared":
+            if len(array) != len(display):
+                raise RuntimeError("array length mismatch for %s in %s" % (
+                    operator, variant_id))
+            missing = [index for index, code in enumerate(array) if not code]
+            if missing != list(unserved.get(operator) or []):
+                raise RuntimeError("unserved mismatch for %s in %s" % (
+                    operator, variant_id))
+        if variant.get("codeMode") == "shared":
             values = list(arrays.values())
             if any(array != values[0] for array in values[1:]):
                 raise RuntimeError("shared variant with differing arrays: %s" % variant_id)
+        for position, code in enumerate(display):
+            if code is None:
+                continue
+            if not any(array[position] == code for array in arrays.values()):
+                raise RuntimeError("display code absent from operator arrays: %s" % variant_id)
 
     operators_output = {}
     for operator, stops in native_stops.items():
