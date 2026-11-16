@@ -239,37 +239,42 @@ ROUTE_FETCHERS = {"KMB": fetch_kmb_routes, "CTB": fetch_ctb_routes}
 
 class StopIndex:
     def __init__(self, stops_payload):
-        self.records, self.grid = {}, defaultdict(list)
+        self.records, self.grid, self.by_td = {}, defaultdict(list), defaultdict(list)
         for key, record in stops_payload.items():
             if record.get("mode") != "bus" or not record.get("loc"):
                 continue
             self.records[key] = record
+            self.by_td[str(record.get("td") or "")].append(key)
             loc = record["loc"]
             self.grid[(int(loc[0] / GRID_CELL), int(loc[1] / GRID_CELL))].append(key)
 
     def candidates(self, operator, stop, override=None):
+        if override is not None:
+            # An explicit override is authoritative: it replaces proximity and
+            # name matching entirely, including the match radius.
+            override = str(override)
+            result = []
+            for key in self.by_td.get(override, ()):
+                record = self.records[key]
+                result.append({"td": override,
+                               "d": round(distance_m(stop["loc"], record["loc"]), 1),
+                               "c": 1.0, "m": "override", "q": 1.0})
+            result.sort(key=lambda row: (row["d"], row["td"]))
+            return result
         rows = []
         cell = (int(stop["loc"][0] / GRID_CELL), int(stop["loc"][1] / GRID_CELL))
         for dr in (-1, 0, 1):
             for dc in (-1, 0, 1):
                 for key in self.grid.get((cell[0] + dr, cell[1] + dc), ()):
                     record = self.records[key]
-                    td = str(record.get("td") or "")
-                    if override is not None and td != str(override):
-                        continue
                     dist = distance_m(stop["loc"], record["loc"])
                     if dist <= MATCH_RADIUS:
                         rows.append((dist, key, record))
-        if override is None:
-            tagged = [row for row in rows if OPERATOR_TAGS[operator]
-                      & set(stop_company_names(row[2]))]
-            rows = tagged or rows
+        tagged = [row for row in rows if OPERATOR_TAGS[operator]
+                  & set(stop_company_names(row[2]))]
+        rows = tagged or rows
         result = []
         for dist, key, record in rows:
-            if override is not None:
-                result.append({"td": str(record["td"]), "d": round(dist, 1),
-                               "c": 1.0, "m": "override", "q": 1.0})
-                continue
             names = [stop_name(record, "en")]
             names.extend(stop_company_names(record).values())
             similarity = max(name_score(stop["en"], name) for name in names)
@@ -897,6 +902,40 @@ def merge_native_only_variants(variants, index_payload, final_stops):
     return stats
 
 
+def annotate_coop_codes(variant):
+    """Mark a co-op variant's per-operator arrays as shared or split.
+
+    Positions an operator's sequence does not serve are filled with the
+    display code and listed in "unserved" (0-based indices into "stops")
+    instead of being left as null. Single-operator variants keep their
+    legacy arrays untouched.
+    """
+    arrays = variant.get("operatorStopCodes") or {}
+    display = variant.get("stops") or []
+    if len(arrays) < 2 or not display:
+        return
+    served = {operator: {i for i, code in enumerate(array) if code}
+              for operator, array in arrays.items()}
+    names = list(arrays)
+    first = names[0]
+    common = set.intersection(*(served[name] for name in names))
+    shared = (bool(common)
+              and all(served[name] == served[first] for name in names)
+              and all(arrays[first][i] == arrays[name][i]
+                      for name in names[1:] for i in common))
+    unserved = {}
+    for operator, array in arrays.items():
+        missing = [i for i, code in enumerate(array) if not code]
+        if missing:
+            unserved[operator] = missing
+            for i in missing:
+                array[i] = display[i]
+    variant["codeMode"] = "shared" if shared else "split"
+    variant.pop("unserved", None)
+    if unserved:
+        variant["unserved"] = unserved
+
+
 def assemble(args, stops_payload, variants, index_payload, native_stops,
              native_routes, previous_state, previous_stops, previous_map,
              previous_td_codes, overrides, started, previous_variants=None):
@@ -1031,6 +1070,9 @@ def assemble(args, stops_payload, variants, index_payload, native_stops,
             variant_mapper, started)
         native_merge_stats = merge_native_only_variants(
             variants, index_payload, final_stops)
+        for variant in variants.values():
+            if is_native_only_variant(variant):
+                annotate_coop_codes(variant)
 
     # Route-specific arrays and canonical display codes.
     td_to_codes = defaultdict(set)
@@ -1046,21 +1088,20 @@ def assemble(args, stops_payload, variants, index_payload, native_stops,
             continue
         td_ids = [key[len(TD_PREFIX):] for key in variant["stops"]]
         by_operator = alignments.get(variant_id, {})
+        agencies = [AGENCY_OPERATOR.get(name) for name in variant.get("co") or []]
+        operators = list(dict.fromkeys(op for op in agencies if op in OPERATORS))
+        cooperative = len(operators) > 1
         operator_arrays = {}
-        for agency in variant.get("co") or []:
-            operator = AGENCY_OPERATOR.get(agency)
-            if operator not in OPERATORS:
-                continue
+        for operator in operators:
             array = [None] * len(td_ids)
             aligned = by_operator.get(operator)
             if aligned:
                 for td_index, native_index, _ in aligned["pairs"]:
                     stop_id = aligned["route"]["stops"][native_index]
                     array[td_index] = registry.native_to_code[native_key(operator, stop_id)]
-            if any(array):
+            if cooperative or any(array):
                 operator_arrays[operator] = array
 
-        agencies = [AGENCY_OPERATOR.get(name) for name in variant.get("co") or []]
         primary_operator = next((op for op in agencies if op in OPERATORS), None)
         display = []
         for position, td in enumerate(td_ids):
@@ -1068,7 +1109,7 @@ def assemble(args, stops_payload, variants, index_payload, native_stops,
             if primary_operator in operator_arrays:
                 code = operator_arrays[primary_operator][position]
             if code is None:
-                for operator in agencies:
+                for operator in operators:
                     if operator in operator_arrays and operator_arrays[operator][position]:
                         code = operator_arrays[operator][position]
                         break
@@ -1081,8 +1122,12 @@ def assemble(args, stops_payload, variants, index_payload, native_stops,
                 raise RuntimeError("no final code for TD stop %s in %s" % (td, variant_id))
             display.append(code)
         variant["stops"] = display
+
         if operator_arrays:
             variant["operatorStopCodes"] = operator_arrays
+        else:
+            variant.pop("operatorStopCodes", None)
+        annotate_coop_codes(variant)
 
         primary = by_operator.get(primary_operator)
         if primary:
@@ -1143,6 +1188,22 @@ def assemble(args, stops_payload, variants, index_payload, native_stops,
     if any(len(code) == BUS_CODE_LEN for code, row in final_stops.items()
            if row.get("mode") == "gmb"):
         raise RuntimeError("GMB received a three-character code")
+
+    # Co-op variants must publish dense arrays; absence is explicit.
+    for variant_id, variant in variants.items():
+        if variant.get("codeMode") not in ("shared", "split"):
+            continue
+        arrays = variant.get("operatorStopCodes") or {}
+        display = variant.get("stops") or []
+        if len(arrays) < 2:
+            raise RuntimeError("co-op variant lacks per-operator arrays: %s" % variant_id)
+        for operator, array in arrays.items():
+            if len(array) != len(display) or any(not code for code in array):
+                raise RuntimeError("non-dense %s array in %s" % (operator, variant_id))
+        if variant["codeMode"] == "shared":
+            values = list(arrays.values())
+            if any(array != values[0] for array in values[1:]):
+                raise RuntimeError("shared variant with differing arrays: %s" % variant_id)
 
     operators_output = {}
     for operator, stops in native_stops.items():
